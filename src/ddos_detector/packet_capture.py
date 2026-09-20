@@ -1,20 +1,101 @@
-"""Packet capture scaffold. Real capture (Scapy/tcpdump) will be implemented later.
+"""Passive packet capture for Linux/WSL2 using Scapy.
 
-Phase 1 unit tests do not require live capture; this module provides safe placeholders.
+This module intentionally avoids shelling out to tcpdump and instead uses Scapy's
+capture APIs directly through a lightweight, non-storing capture queue.
+
+The capture implementation is provided as a context manager with a small
+read_packets(count:int)->List[Packet] API that the live monitor expects. This
+file implements a capture backed by Scapy's AsyncSniffer (preferred) while
+maintaining backward-compatible behavior.
 """
+
+from __future__ import annotations
+
+import os
+import platform
+from collections import deque
+from typing import Any, Deque, List
+
+from scapy.all import AsyncSniffer
+
+
+class ScapyAsyncCapture:
+    """Context manager that captures packets using Scapy.AsyncSniffer.
+
+    Provides:
+      - __enter__/__exit__ for use in `with open_capture(...) as capture:`
+      - read_packets(count) -> List[Packet]
+      - stop() to request graceful shutdown
+
+    The implementation does not store packets in Scapy (store=False) and
+    appends incoming packets into a bounded in-memory deque that is drained by
+    the monitor loop. This avoids unbounded memory growth.
+    """
+
+    def __init__(self, interface: str, bpf_filter: str = "", queue_max: int = 10000):
+        self.interface = interface
+        self.bpf_filter = bpf_filter or ""
+        self._queue: Deque[Any] = deque()
+        self._sniffer: AsyncSniffer | None = None
+        self._stopped = False
+        self._queue_max = max(1, int(queue_max))
+
+    def _on_packet(self, packet: Any) -> None:
+        # Drop packets if queue grows too large to avoid memory blowups
+        if packet is None:
+            return
+        if len(self._queue) >= self._queue_max:
+            # drop oldest to make room
+            try:
+                self._queue.popleft()
+            except IndexError:
+                pass
+        self._queue.append(packet)
+
+    def __enter__(self):
+        if os.name == "nt" or platform.system() != "Linux":
+            raise OSError("Live packet capture requires Linux/WSL2.")
+        self._stopped = False
+        # AsyncSniffer runs in a background thread and can be started/stopped.
+        self._sniffer = AsyncSniffer(iface=self.interface, filter=self.bpf_filter, prn=self._on_packet, store=False)
+        self._sniffer.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        # Ensure the sniffer is stopped on context exit
+        self.stop()
+        return False
+
+    def stop(self) -> None:
+        if self._stopped:
+            return
+        self._stopped = True
+        if self._sniffer is not None:
+            try:
+                self._sniffer.stop()
+            except Exception:
+                # best-effort stop; swallow exceptions to allow graceful shutdown
+                pass
+
+    def read_packets(self, count: int = 100) -> List[Any]:
+        packets: List[Any] = []
+        while len(packets) < max(1, int(count)) and self._queue:
+            packets.append(self._queue.popleft())
+        return packets
+
+
+LinuxPacketCapture = ScapyAsyncCapture
 
 
 def open_capture(interface: str, bpf_filter: str = ""):
-    """Return a context manager-like object that yields packets. Placeholder for Phase 1."""
+    """Return a Linux capture session compatible with the live monitor pipeline.
 
-    class DummyCapture:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def read_packets(self, count: int = 100):
-            return []
-
-    return DummyCapture()
+    This returns a context manager that implements the minimal capture API used
+    by the monitor. Keep the function signature stable for backward
+    compatibility.
+    """
+    if not interface:
+        raise ValueError("Network interface is required for live monitoring")
+    if os.name == "nt" or platform.system() != "Linux":
+        raise OSError("Live packet capture requires Linux/WSL2.")
+    return ScapyAsyncCapture(interface=interface, bpf_filter=bpf_filter)

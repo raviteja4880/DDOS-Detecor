@@ -317,3 +317,185 @@ Before use, the project ensures:
 - failures are handled gracefully with clear error messages
 
 The design is intentionally defensive and suitable for use as a student project, demonstration, or technical lab exercise.
+
+## 26. WSL2 Localhost Demonstration
+
+This walkthrough is for a controlled localhost/private-lab demonstration only. It must not be used against public or third-party systems.
+
+### Step 1: Enter WSL2
+
+From Windows PowerShell, enter your Linux distribution once:
+
+```powershell
+wsl
+```
+
+Once inside WSL, do **not** run `wsl` again. The remaining commands are Linux shell commands.
+
+### Step 2: Enter the project directory
+
+Replace the path below with the actual project location:
+
+```bash
+cd /path/to/DDOS
+```
+
+### Step 3: Verify the environment
+
+```bash
+python --version
+nft --version
+tcpdump --version
+```
+
+Use the Linux project interpreter for project execution:
+
+```bash
+.venv-linux/bin/python --version
+```
+
+### Step 4: Install dependencies
+
+This repository declares runtime and test dependencies in `requirements.txt` and is packaged through `pyproject.toml`. From the project root, use:
+
+```bash
+.venv-linux/bin/python -m pip install -r requirements.txt
+.venv-linux/bin/python -m pip install -e .
+```
+
+### Step 5: Configure Brevo
+
+Copy `.env.example` to `.env` if needed, then set the values locally. `.env.example` contains placeholders only. Never commit `.env` or display its contents.
+
+The supported variable names are:
+
+```text
+BREVO_API_KEY
+BREVO_SENDER_EMAIL
+BREVO_SENDER_NAME
+BREVO_ALERT_RECIPIENT
+```
+
+Load the environment before starting the monitor with `sudo`:
+
+```bash
+set -a
+source .env
+set +a
+```
+
+Verify only whether each variable is set; these commands do not print secret values:
+
+```bash
+[ -n "$BREVO_API_KEY" ] && echo "BREVO_API_KEY: SET" || echo "BREVO_API_KEY: NOT SET"
+[ -n "$BREVO_SENDER_EMAIL" ] && echo "BREVO_SENDER_EMAIL: SET" || echo "BREVO_SENDER_EMAIL: NOT SET"
+[ -n "$BREVO_SENDER_NAME" ] && echo "BREVO_SENDER_NAME: SET" || echo "BREVO_SENDER_NAME: NOT SET"
+[ -n "$BREVO_ALERT_RECIPIENT" ] && echo "BREVO_ALERT_RECIPIENT: SET" || echo "BREVO_ALERT_RECIPIENT: NOT SET"
+```
+
+### Step 6: Clean detector-owned nftables rules
+
+Before a fresh demonstration, remove only mitigation rules owned by this project:
+
+```bash
+sudo .venv-linux/bin/python -m ddos_detector cleanup --all
+```
+
+Do **not** run:
+
+```bash
+sudo nft flush ruleset
+```
+
+That command can remove unrelated firewall rules.
+
+### Step 7: Start the local test server
+
+In a separate WSL terminal, bind the server only to loopback:
+
+```bash
+.venv-linux/bin/python -m http.server 18080 --bind 127.0.0.1
+```
+
+This creates a local-only HTTP target.
+
+### Step 8: Start the DDoS detector
+
+In another WSL terminal, from the project directory:
+
+```bash
+sudo -E .venv-linux/bin/python -m ddos_detector monitor \
+  --config config/config.yaml \
+  --interface lo
+```
+
+The monitor may report:
+
+- `BASELINE_WARMUP`
+- `NORMAL`
+- `SUSPICIOUS`
+- `HIGH_RISK`
+- triggered anomaly indicators and score
+- alert and mitigation status
+
+### Step 9: Generate controlled localhost demonstration traffic
+
+Run only this bounded loop against the local server:
+
+```bash
+for i in $(seq 1 100); do
+    curl -s --max-time 2 http://127.0.0.1:18080/ > /dev/null &
+done
+wait
+```
+
+This is **controlled localhost demonstration traffic**. Do not substitute a public address, external hostname, or third-party target.
+
+### Step 10: Inspect detector-owned nftables rules
+
+```bash
+sudo nft -a list table inet ddos_detector
+```
+
+During a configured `HIGH_RISK` response, a temporary detector-owned rule may look like:
+
+```text
+ip saddr 127.0.0.1 ip daddr 127.0.0.1 iifname "lo" drop comment "ddos_detector:source-live-..."
+```
+
+The rule ID and handle are generated at runtime; do not assume a particular value.
+
+### Step 11: Verify recovery
+
+After the bounded traffic stops, allow subsequent windows to process. The monitor should return toward:
+
+```text
+classification: NORMAL
+```
+
+This demonstrates recovery after the abnormal localhost window.
+
+### Step 12: Stop the monitor
+
+Return to the monitor terminal and press:
+
+```text
+Ctrl+C
+```
+
+Stop the temporary HTTP server with `Ctrl+C` in its terminal as well.
+
+### Step 13: Clean detector-owned nftables rules
+
+```bash
+sudo .venv-linux/bin/python -m ddos_detector cleanup --all
+sudo nft -a list table inet ddos_detector
+```
+
+Cleanup removes detector-owned mitigation rules only. It does not flush unrelated nftables rules.
+
+### Step 14: Run the test suite
+
+```bash
+.venv-linux/bin/python -m pytest -q
+```

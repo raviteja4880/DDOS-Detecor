@@ -18,6 +18,8 @@ class MitigationRule:
     target: str
     interface: str
     reason: str
+    match: str = "daddr"  # 'daddr' for destination match, 'saddr' for source match
+    source_ip: str | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     expires_at: datetime | None = None
     status: str = "active"
@@ -41,6 +43,8 @@ class MitigationConfig:
     mechanism: str = "nftables"
     rule_ttl_seconds: int = 60
     max_rules: int = 20
+    auto_block_sources: bool = False
+    max_auto_block_sources: int = 5
 
     def validate(self) -> None:
         if not isinstance(self.enabled, bool):
@@ -53,6 +57,10 @@ class MitigationConfig:
             raise ValueError("mitigation.rule_ttl_seconds must be between 1 and 86400")
         if self.max_rules <= 0 or self.max_rules > 500:
             raise ValueError("mitigation.max_rules must be between 1 and 500")
+        if not isinstance(self.auto_block_sources, bool):
+            raise ValueError("mitigation.auto_block_sources must be boolean")
+        if self.max_auto_block_sources <= 0 or self.max_auto_block_sources > 5:
+            raise ValueError("mitigation.max_auto_block_sources must be between 1 and 5")
 
 
 class MitigationManager:
@@ -186,14 +194,18 @@ class MitigationManager:
             self.TABLE_NAME,
             self.CHAIN_NAME,
             "ip",
-            "daddr",
-            rule.target,
+        ]
+        if getattr(rule, "match", "daddr") == "saddr":
+            add_rule.extend(["saddr", rule.source_ip or rule.target, "ip", "daddr", rule.target])
+        else:
+            add_rule.extend(["daddr", rule.target])
+        add_rule.extend([
             "iifname",
             rule.interface,
             "drop",
             "comment",
             rule_comment_arg,
-        ]
+        ])
         add_result = self._run_nft_command(add_rule)
         if add_result.returncode != 0:
             raise RuntimeError(f"Failed to add nftables rule: {add_result.stderr.strip() or add_result.stdout.strip()}")
@@ -306,7 +318,7 @@ class MitigationManager:
         if len(self.rules) >= self.config.max_rules:
             self.rules = self.rules[-(self.config.max_rules - 1) :]
 
-    def dry_run_apply(self, target: str, interface: str, reason: str) -> Dict[str, Any]:
+    def dry_run_apply(self, target: str, interface: str, reason: str, source: bool = False, source_ip: str | None = None) -> Dict[str, Any]:
         self.validate_target(target, interface)
         self._prune_expired()
         rule = MitigationRule(
@@ -315,6 +327,8 @@ class MitigationManager:
             target=target,
             interface=interface,
             reason=reason,
+            match=("saddr" if source else "daddr"),
+            source_ip=source_ip,
             expires_at=datetime.now(timezone.utc) + timedelta(seconds=self.config.rule_ttl_seconds),
             status="dry_run",
         )
@@ -328,11 +342,11 @@ class MitigationManager:
             "rule_id": rule.rule_id,
         }
 
-    def apply(self, target: str, interface: str, reason: str) -> Dict[str, Any]:
+    def apply(self, target: str, interface: str, reason: str, source: bool = False, source_ip: str | None = None) -> Dict[str, Any]:
         if not self.config.enabled:
             return {"success": False, "dry_run": True, "error": "mitigation_disabled", "message": "Mitigation disabled by configuration; no system rules changed."}
         if self.config.dry_run:
-            return self.dry_run_apply(target, interface, reason)
+            return self.dry_run_apply(target, interface, reason, source=source, source_ip=source_ip)
         try:
             self.validate_target(target, interface)
         except ValueError as exc:
@@ -350,11 +364,13 @@ class MitigationManager:
             return {"success": False, "dry_run": False, "error": "insufficient_privileges", "message": "Live mitigation requires root privileges on Linux."}
         self._prune_expired()
         rule = MitigationRule(
-            rule_id=f"live-{len(self.rules)+1}",
+            rule_id=f"source-live-{len(self.rules)+1}" if source else f"live-{len(self.rules)+1}",
             rule_type=self.config.mechanism,
             target=target,
             interface=interface,
             reason=reason,
+            match=("saddr" if source else "daddr"),
+            source_ip=source_ip,
             expires_at=datetime.now(timezone.utc) + timedelta(seconds=self.config.rule_ttl_seconds),
             status="active",
         )
@@ -366,6 +382,18 @@ class MitigationManager:
         except Exception as exc:  # pragma: no cover - defensive fallback
             return {"success": False, "dry_run": False, "error": "mitigation_failed", "message": str(exc)}
         return {"success": True, "dry_run": False, "rule": rule.describe(), "message": "Live nftables mitigation rule added."}
+
+    def apply_source(self, source_ip: str, target_ip: str, interface: str, reason: str) -> Dict[str, Any]:
+        """Apply a source-and-destination nftables rule for one detected source."""
+        self.validate_target(target_ip, interface)
+        try:
+            ip_address(source_ip)
+        except ValueError as exc:
+            return {"success": False, "dry_run": self.config.dry_run, "error": "invalid_source", "message": "Source IP must be a valid IP address"}
+        source_addr = ip_address(source_ip)
+        if source_addr.is_global:
+            return {"success": False, "dry_run": self.config.dry_run, "error": "public_source_rejected", "message": "Public source IPs are rejected"}
+        return self.apply(target_ip, interface, reason, source=True, source_ip=source_ip)
 
     def cleanup_expired(self, now: Optional[datetime] = None) -> List[str]:
         if now is None:

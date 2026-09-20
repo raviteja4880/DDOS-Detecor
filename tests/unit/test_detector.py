@@ -57,3 +57,47 @@ def test_detector_requires_multiple_indicators_for_high_risk():
     current = make_metric(300, 100000, 12, 12, 10, 4, dest_concentration=0.14)
     result = analyze_window(current, engine, minimum_indicators=2)
     assert result.classification == "NORMAL"
+
+
+def test_distributed_source_requires_at_least_two_sources():
+    engine = BaselineEngine(history_windows=10, minimum_samples=1)
+    engine.update(make_metric(100, 20000, 5, 5, 0, 1), is_anomalous=False)
+
+    result = analyze_window(
+        make_metric(100, 20000, 5, 5, 1, 1),
+        engine,
+        minimum_indicators=1,
+    )
+
+    distributed = next(item for item in result.indicators if item.name == "distributed-source anomaly")
+    assert distributed.triggered is False
+
+
+def test_distributed_source_triggers_for_significant_multi_source_increase():
+    engine = BaselineEngine(history_windows=10, minimum_samples=1)
+    engine.update(make_metric(100, 20000, 5, 5, 1, 1), is_anomalous=False)
+
+    result = analyze_window(
+        make_metric(100, 20000, 5, 5, 3, 1),
+        engine,
+        minimum_indicators=1,
+    )
+
+    distributed = next(item for item in result.indicators if item.name == "distributed-source anomaly")
+    assert distributed.triggered is True
+
+
+def test_other_indicators_are_unchanged_for_single_source():
+    engine = BaselineEngine(history_windows=10, minimum_samples=1)
+    engine.update(make_metric(100, 20000, 5, 5, 1, 1), is_anomalous=False)
+
+    result = analyze_window(
+        make_metric(1000, 200000, 5, 5, 1, 1),
+        engine,
+        minimum_indicators=1,
+    )
+
+    packet_rate = next(item for item in result.indicators if item.name == "packet-rate anomaly")
+    distributed = next(item for item in result.indicators if item.name == "distributed-source anomaly")
+    assert packet_rate.triggered is True
+    assert distributed.triggered is False

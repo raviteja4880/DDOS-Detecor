@@ -22,8 +22,8 @@ class Config:
     detection: Dict[str, Any] = field(default_factory=lambda: {"minimum_indicators": 2, "minimum_consecutive_windows": 1})
     scoring: Dict[str, Any] = field(default_factory=lambda: {"weights": {"syn_rate": 1.0, "packet_rate": 0.8, "distributed_source": 1.0, "connection_rate": 0.7, "dest_concentration": 0.5}, "thresholds": {"normal": 0.2, "suspicious": 0.6}})
     simulation: Dict[str, Any] = field(default_factory=lambda: {"enabled": True, "mode": "normal", "rate_limit": 1000, "packet_limit": 50000, "target": "127.0.0.1", "max_sources": 20})
-    alerts: Dict[str, Any] = field(default_factory=lambda: {"enabled": True, "console": True, "structured_logging": True})
-    mitigation: Dict[str, Any] = field(default_factory=lambda: {"enabled": False, "dry_run": True, "mechanism": "nftables", "rule_ttl_seconds": 60})
+    alerts: Dict[str, Any] = field(default_factory=lambda: {"enabled": True, "console": True, "structured_logging": True, "email": {"enabled": False, "provider": "brevo", "cooldown_seconds": 60}})
+    mitigation: Dict[str, Any] = field(default_factory=lambda: {"enabled": False, "dry_run": True, "mechanism": "nftables", "rule_ttl_seconds": 60, "auto_block_sources": False, "max_auto_block_sources": 5})
 
 
 DEFAULT_CAPTURE = {"bpf_filter": "", "snaplen": 262144}
@@ -34,8 +34,8 @@ DEFAULT_BASELINE = {"history_windows": 60, "minimum_samples": 10}
 DEFAULT_DETECTION = {"minimum_indicators": 2, "minimum_consecutive_windows": 1}
 DEFAULT_SCORING = {"weights": DEFAULT_WEIGHTS.copy(), "thresholds": DEFAULT_THRESHOLDS.copy()}
 DEFAULT_SIMULATION = {"enabled": True, "mode": "normal", "rate_limit": 1000, "packet_limit": 50000, "target": "127.0.0.1", "max_sources": 20}
-DEFAULT_ALERTS = {"enabled": True, "console": True, "structured_logging": True}
-DEFAULT_MITIGATION = {"enabled": False, "dry_run": True, "mechanism": "nftables", "rule_ttl_seconds": 60}
+DEFAULT_ALERTS = {"enabled": True, "console": True, "structured_logging": True, "email": {"enabled": False, "provider": "brevo", "cooldown_seconds": 60}}
+DEFAULT_MITIGATION = {"enabled": False, "dry_run": True, "mechanism": "nftables", "rule_ttl_seconds": 60, "auto_block_sources": False, "max_auto_block_sources": 5}
 
 
 def _is_safe_local_target(target: str) -> bool:
@@ -153,6 +153,11 @@ def validate_config(cfg: Config) -> Config:
     ttl = int(cfg.mitigation.get("rule_ttl_seconds", DEFAULT_MITIGATION["rule_ttl_seconds"]))
     if ttl <= 0 or ttl > 86400:
         raise ValueError("Configuration error: mitigation.rule_ttl_seconds must be between 1 and 86400")
+    if not isinstance(cfg.mitigation.get("auto_block_sources", False), bool):
+        raise ValueError("Configuration error: mitigation.auto_block_sources must be boolean")
+    max_auto = int(cfg.mitigation.get("max_auto_block_sources", DEFAULT_MITIGATION["max_auto_block_sources"]))
+    if max_auto <= 0 or max_auto > 100:
+        raise ValueError("Configuration error: mitigation.max_auto_block_sources must be between 1 and 100")
     return cfg
 
 

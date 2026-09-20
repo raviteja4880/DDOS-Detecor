@@ -70,6 +70,8 @@ class TrafficDetector:
             if name == "destination concentration anomaly":
                 triggered = current.dest_concentration > max(0.15, (baseline_value * 3.0) if baseline_value else 0.15)
                 deviation = current.dest_concentration / max(0.001, baseline_value)
+            if name == "distributed-source anomaly" and current.unique_src_ips < 2:
+                triggered = False
             explanation = (
                 f"{name}: current={current_value:.2f}, baseline={baseline_value:.2f}, "
                 f"deviation={deviation:.2f}x"

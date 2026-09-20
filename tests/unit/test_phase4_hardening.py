@@ -9,8 +9,9 @@ sys.path.insert(0, str(ROOT / "src"))
 import pytest
 
 from ddos_detector.config import Config, validate_config
-from ddos_detector.main import build_parser, main
+from ddos_detector.main import _run_monitor, build_parser, main
 from ddos_detector.mitigation import MitigationManager, MitigationRule
+from ddos_detector.models import PacketRecord, WindowMetric
 
 
 def test_validate_config_rejects_invalid_thresholds():
@@ -212,3 +213,87 @@ def test_cleanup_removes_only_tracked_nftables_rule(monkeypatch):
     assert removed == ["live-1"]
     assert not manager.rules
     assert any(cmd[:4] == ["nft", "delete", "rule", "inet"] for cmd in calls)
+
+
+def test_monitor_rejects_windows_live_capture(monkeypatch, capsys):
+    monkeypatch.setattr("ddos_detector.main.os.name", "nt", raising=False)
+    monkeypatch.setattr("ddos_detector.main.platform.system", lambda: "Windows", raising=False)
+    result = main(["monitor", "--interface", "eth0"])
+    captured = capsys.readouterr()
+    assert result == 2
+    assert "Linux/WSL2" in captured.err
+
+
+def test_monitor_rejects_missing_interface(monkeypatch, capsys):
+    monkeypatch.setattr("ddos_detector.main.os.name", "posix", raising=False)
+    monkeypatch.setattr("ddos_detector.main.platform.system", lambda: "Linux", raising=False)
+    monkeypatch.setattr("ddos_detector.main.os.path.isdir", lambda path: False)
+    result = main(["monitor", "--interface", "missing0"])
+    captured = capsys.readouterr()
+    assert result == 2
+    assert "does not exist" in captured.err
+
+
+def test_packet_capture_reads_queued_packets():
+    from ddos_detector.packet_capture import LinuxPacketCapture
+
+    capture = LinuxPacketCapture("lo")
+    capture._queue.append("packet-1")
+    capture._queue.append("packet-2")
+    assert capture.read_packets(10) == ["packet-1", "packet-2"]
+    assert capture.read_packets(10) == []
+
+
+def test_monitor_uses_detected_normal_window(monkeypatch):
+    class FakeCapture:
+        def __init__(self):
+            self.calls = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read_packets(self, count=100):
+            self.calls += 1
+            if self.calls == 1:
+                return [PacketRecord(timestamp=1.0, src_ip="10.0.0.1", dst_ip="10.0.0.2", src_port=1234, dst_port=80, protocol="TCP", packet_size=128, tcp_flags="S")]
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr("ddos_detector.main.os.name", "posix", raising=False)
+    monkeypatch.setattr("ddos_detector.main.platform.system", lambda: "Linux", raising=False)
+    monkeypatch.setattr("ddos_detector.main.os.path.isdir", lambda path: True)
+    monkeypatch.setattr("ddos_detector.main.open_capture", lambda interface, bpf_filter="": FakeCapture())
+    monkeypatch.setattr("ddos_detector.main.parse_packet", lambda packet: packet)
+    monkeypatch.setattr(
+        "ddos_detector.main.compute_window_metrics",
+        lambda packets, seconds: WindowMetric(
+            window_seconds=seconds,
+            packets=len(packets),
+            bytes=128,
+            packets_per_sec=1.0,
+            bytes_per_sec=128.0,
+            tcp_packets=1,
+            udp_packets=0,
+            icmp_packets=0,
+            syn_packets=1,
+            connection_attempts=1,
+            unique_src_ips=1,
+            unique_dst_ips=1,
+            dst_port_distribution={80: 1},
+            avg_packet_size=128.0,
+            burst_intensity=1.0,
+            dest_concentration=1.0,
+            raw=packets,
+        ),
+    )
+    monkeypatch.setattr("ddos_detector.main.BaselineEngine.is_ready", lambda self: True)
+    monkeypatch.setattr("ddos_detector.main.analyze_window", lambda current, baseline, minimum_indicators=2: type("D", (), {"indicators": [], "triggered_indicators": [], "reason": "No anomaly detected", "score": 0.0, "classification": "NORMAL"})())
+    monkeypatch.setattr("ddos_detector.main.score_and_classify", lambda indicators, weights=None, thresholds=None: (0.05, "NORMAL"))
+    monkeypatch.setattr("ddos_detector.main.maybe_emit_alert", lambda *args, **kwargs: None)
+    monkeypatch.setattr("ddos_detector.main.time.sleep", lambda _: None)
+
+    cfg = Config(interface="lo")
+    result = _run_monitor(type("Args", (), {"interface": "lo"})(), cfg)
+    assert result == 0

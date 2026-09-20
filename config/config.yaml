@@ -44,8 +44,14 @@ alerts:
   enabled: true
   console: true
   structured_logging: true
+  email:
+    enabled: true
+    provider: brevo
+    cooldown_seconds: 60
 mitigation:
-  enabled: false
-  dry_run: true
+  enabled: true
+  dry_run: false
   mechanism: nftables
   rule_ttl_seconds: 60
+  auto_block_sources: true
+  max_auto_block_sources: 5

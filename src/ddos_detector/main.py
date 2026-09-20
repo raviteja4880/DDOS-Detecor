@@ -6,15 +6,21 @@ enabled in configuration.
 """
 import argparse
 import json
+import os
+import platform
 import sys
+import time
 
 from .alerts import maybe_emit_alert
+from .aggregator import compute_window_metrics
 from .baseline import BaselineEngine
 from .config import load_config
 from .detector import analyze_window
 from .logging_config import setup_logging
 from .mitigation import MitigationManager
 from .models import WindowMetric
+from .packet_capture import open_capture
+from .packet_parser import parse_packet
 from .scoring import score_and_classify
 from .simulator import simulate_window, validate_simulation_config
 
@@ -143,12 +149,188 @@ def _run_alert(args, cfg):
         list(args.reason),
         current_metrics={"packets_per_sec": 1200, "unique_src_ips": 42},
         baseline={"packets_per_sec": 180, "unique_src_ips": 9},
+        alert_cfg=getattr(cfg, "alerts", None) or cfg.alerts,
     )
     if alert is None:
         print(json.dumps({"classification": args.classification, "score": float(args.score), "emitted": False}, sort_keys=True))
         return 0
     print(json.dumps(alert, sort_keys=True))
     return 0
+
+
+def _run_monitor(args, cfg, capture_factory=None):
+    if capture_factory is None:
+        capture_factory = open_capture
+    if platform.system() != "Linux":
+        print("Live monitoring requires Linux/WSL2. Windows is not supported for packet capture.", file=sys.stderr)
+        return 2
+
+    interface = getattr(args, "interface", None) or cfg.interface
+    if not interface:
+        print("No interface was provided and no default interface is configured.", file=sys.stderr)
+        return 2
+    if not os.path.isdir(f"/sys/class/net/{interface}"):
+        print(f"Interface '{interface}' does not exist on this Linux host.", file=sys.stderr)
+        return 2
+
+    baseline_engine = BaselineEngine(
+        history_windows=int(cfg.baseline.get("history_windows", 60)),
+        minimum_samples=int(cfg.baseline.get("minimum_samples", 10)),
+    )
+    window_packets = []
+    window_start = time.monotonic()
+    print(f"Monitoring interface {interface} using passive capture. Press Ctrl+C to stop.")
+    try:
+        with capture_factory(interface, cfg.capture.get("bpf_filter", "")) as capture:
+            while True:
+                batch = capture.read_packets(count=100)
+                for packet in batch:
+                    try:
+                        record = parse_packet(packet)
+                    except (TypeError, ValueError):
+                        continue
+                    window_packets.append(record)
+
+                now = time.monotonic()
+                if (now - window_start) < cfg.window_seconds:
+                    continue
+
+                window_metric = compute_window_metrics(window_packets, cfg.window_seconds)
+                window_packets = []
+                window_start = now
+
+                if not baseline_engine.is_ready():
+                    baseline_engine.update(window_metric, is_anomalous=False)
+                    print(
+                        "LIVE WINDOW "
+                        f"packet-rate: {window_metric.packets_per_sec:.1f} pps "
+                        f"byte-rate: {window_metric.bytes_per_sec/1024:.1f} KB/s "
+                        f"SYN-rate: {window_metric.syn_packets / max(1, window_metric.window_seconds):.1f}/s "
+                        f"connection-rate: {window_metric.connection_attempts / max(1, window_metric.window_seconds):.1f}/s "
+                        f"distributed-source: {window_metric.unique_src_ips} "
+                        f"classification: BASELINE_WARMUP"
+                    )
+                    continue
+
+                detection = analyze_window(window_metric, baseline_engine, minimum_indicators=int(cfg.detection.get("minimum_indicators", 2)))
+                score, classification = score_and_classify(
+                    detection.indicators,
+                    weights=cfg.scoring.get("weights", cfg.weights),
+                    thresholds=cfg.scoring.get("thresholds", cfg.thresholds),
+                )
+                detection.score = float(score)
+                detection.classification = classification
+
+                if classification == "NORMAL":
+                    baseline_engine.update(window_metric, is_anomalous=False)
+                else:
+                    baseline_engine.update(window_metric, is_anomalous=True)
+
+                print(
+                    "LIVE WINDOW "
+                    f"packet-rate: {window_metric.packets_per_sec:.1f} pps "
+                    f"byte-rate: {window_metric.bytes_per_sec/1024:.1f} KB/s "
+                    f"SYN-rate: {window_metric.syn_packets / max(1, window_metric.window_seconds):.1f}/s "
+                    f"connection-rate: {window_metric.connection_attempts / max(1, window_metric.window_seconds):.1f}/s "
+                    f"distributed-source: {window_metric.unique_src_ips} "
+                    f"destination-concentration: {window_metric.dest_concentration:.3f} "
+                    f"score: {score:.2f} "
+                    f"classification: {classification}"
+                )
+                if classification in {"SUSPICIOUS", "HIGH_RISK"}:
+                    reasons = detection.triggered_indicators or [detection.reason]
+                    baseline_snapshot = baseline_engine.snapshot()
+                    raw_packets = window_metric.raw or []
+                    source_ips = sorted({packet.src_ip for packet in raw_packets if packet.src_ip})
+                    target_ips = sorted({packet.dst_ip for packet in raw_packets if packet.dst_ip})
+                    target_ports = sorted({packet.dst_port for packet in raw_packets if packet.dst_port is not None})
+                    mitigation_cfg = cfg.mitigation if isinstance(cfg.mitigation, dict) else {}
+                    alert = maybe_emit_alert(
+                        classification,
+                        float(score),
+                        reasons,
+                        current_metrics={
+                            "packets_per_sec": window_metric.packets_per_sec,
+                            "bytes_per_sec": window_metric.bytes_per_sec,
+                            "syn_rate": window_metric.syn_packets / max(1, window_metric.window_seconds),
+                            "connection_rate": window_metric.connection_attempts / max(1, window_metric.window_seconds),
+                            "unique_src_ips": window_metric.unique_src_ips,
+                            "dest_concentration": window_metric.dest_concentration,
+                        },
+                        baseline={
+                            "packets_per_sec": baseline_snapshot.mean.get("packets_per_sec", 0.0),
+                            "bytes_per_sec": baseline_snapshot.mean.get("bytes_per_sec", 0.0),
+                            "syn_rate": baseline_snapshot.mean.get("syn_packets", 0.0) / max(1, window_metric.window_seconds),
+                            "connection_rate": baseline_snapshot.mean.get("connection_attempts", 0.0) / max(1, window_metric.window_seconds),
+                            "unique_src_ips": baseline_snapshot.mean.get("unique_src_ips", 0.0),
+                        },
+                        alert_cfg=getattr(cfg, "alerts", None) or cfg.alerts,
+                        context={
+                            "interface": interface,
+                            "source_ips": source_ips,
+                            "target_ips": target_ips,
+                            "target_ports": target_ports,
+                            "mitigation": {
+                                "enabled": bool(mitigation_cfg.get("enabled", False)),
+                                "auto_block_sources": bool(mitigation_cfg.get("auto_block_sources", False)),
+                                "mechanism": mitigation_cfg.get("mechanism", "nftables"),
+                                "max_auto_block_sources": mitigation_cfg.get("max_auto_block_sources", 5),
+                                "rule_ttl_seconds": mitigation_cfg.get("rule_ttl_seconds", 60),
+                            },
+                        },
+                    )
+
+                    # Optionally auto-block top source IPs for HIGH_RISK when configured
+                    try:
+                        auto_block = (cfg.mitigation.get("auto_block_sources") if isinstance(cfg.mitigation, dict) else getattr(cfg.mitigation, "auto_block_sources", None))
+                    except Exception:
+                        auto_block = False
+                    if classification == "HIGH_RISK" and auto_block:
+                        # Only perform mitigation when mitigation is enabled in config
+                        mitig_cfg = cfg.mitigation if isinstance(cfg.mitigation, dict) else getattr(cfg, "mitigation", {})
+                        if mitig_cfg.get("enabled"):
+                            from .mitigation import MitigationManager
+                            manager = MitigationManager(mitig_cfg)
+                            # select top source IPs from raw packet records
+                            srcs = [p.src_ip for p in (window_metric.raw or []) if getattr(p, 'src_ip', None)]
+                            from collections import Counter
+                            counts = Counter(srcs)
+                            limit = int(mitig_cfg.get("max_auto_block_sources", 5))
+                            blocked_this_window = 0
+                            for src, _ in counts.most_common():
+                                if blocked_this_window >= limit:
+                                    break
+                                try:
+                                    destinations = Counter(
+                                        p.dst_ip for p in (window_metric.raw or [])
+                                        if getattr(p, "src_ip", None) == src and getattr(p, "dst_ip", None)
+                                    )
+                                    target = destinations.most_common(1)[0][0] if destinations else None
+                                    if not target:
+                                        continue
+                                    result = manager.apply_source(src, target, interface, "auto-block from monitor HIGH_RISK")
+                                    if result.get("success"):
+                                        blocked_this_window += 1
+                                    print(f"Mitigation: {result.get('message')}")
+                                except Exception as exc:
+                                    print(f"Mitigation failed for {src}: {exc}")
+
+                if classification in {"SUSPICIOUS", "HIGH_RISK"}:
+                    print("Indicators:")
+                    for indicator in detection.indicators:
+                        if indicator.triggered:
+                            print(f"- {indicator.name}: deviation={indicator.deviation:.2f}x")
+
+                time.sleep(0.05)
+    except KeyboardInterrupt:
+        print("\nStopping live monitor.")
+        return 0
+    except OSError as exc:
+        print(f"Live monitoring failed: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        print(f"Live monitoring error: {exc}", file=sys.stderr)
+        return 1
 
 
 def _run_mitigation(args, cfg):
@@ -179,8 +361,7 @@ def main(argv=None):
         setup_logging(cfg.logging.get("level", "INFO"), cfg.logging.get("json", False))
 
         if args.command == "monitor":
-            print("Passive monitor mode ready. Phase 1 foundation only.")
-            return 0
+            return _run_monitor(args, cfg)
 
         if args.command == "detect":
             baseline_engine = BaselineEngine(history_windows=int(cfg.baseline.get("history_windows", 60)), minimum_samples=int(cfg.baseline.get("minimum_samples", 10)))
