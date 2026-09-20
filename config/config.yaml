@@ -1,0 +1,51 @@
+# Example configuration for distributed-ddos-detector (Phase 2)
+interface: lo
+window_seconds: 5
+slide_seconds: 1
+capture:
+  bpf_filter: ""
+  snaplen: 262144
+weights:
+  syn_rate: 1.0
+  packet_rate: 0.8
+  distributed_source: 1.0
+  connection_rate: 0.7
+  dest_concentration: 0.5
+thresholds:
+  normal: 0.2
+  suspicious: 0.6
+baseline:
+  history_windows: 60
+  minimum_samples: 10
+detection:
+  minimum_indicators: 2
+  minimum_consecutive_windows: 1
+scoring:
+  weights:
+    syn_rate: 1.0
+    packet_rate: 0.8
+    distributed_source: 1.0
+    connection_rate: 0.7
+    dest_concentration: 0.5
+  thresholds:
+    normal: 0.20
+    suspicious: 0.60
+logging:
+  level: INFO
+  json: false
+simulation:
+  enabled: true
+  mode: normal
+  target: 127.0.0.1
+  rate_limit: 500
+  packet_limit: 20000
+  max_sources: 20
+alerts:
+  enabled: true
+  console: true
+  structured_logging: true
+mitigation:
+  enabled: false
+  dry_run: true
+  mechanism: nftables
+  rule_ttl_seconds: 60

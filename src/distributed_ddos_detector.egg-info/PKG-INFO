@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: distributed-ddos-detector
+Version: 0.1.0
+Summary: Educational distributed DDoS detection prototype with explainable rules and safe lab-only mitigation
+Requires-Python: >=3.10
