@@ -37,10 +37,24 @@ class BaselineEngine:
     def update(self, metric: WindowMetric, is_anomalous: bool = False) -> bool:
         if is_anomalous:
             return False
+        if self.is_ready() and self._is_extreme_outlier(metric):
+            return False
         self.history.append(metric)
         if len(self.history) > self.history_windows:
             self.history.pop(0)
         return True
+
+    def _is_extreme_outlier(self, metric: WindowMetric) -> bool:
+        attrs = ("packets_per_sec", "bytes_per_sec", "syn_packets", "connection_attempts", "unique_src_ips")
+        snapshot = self.snapshot()
+        for attr in attrs:
+            current = float(getattr(metric, attr, 0.0))
+            mean_value = snapshot.mean.get(attr, 0.0)
+            std_value = snapshot.stddev.get(attr, 0.0)
+            limit = max(mean_value * 4.0, mean_value + max(3.0 * std_value, 1.0))
+            if mean_value > 0 and current > limit:
+                return True
+        return False
 
     def snapshot(self) -> BaselineSnapshot:
         attrs = [

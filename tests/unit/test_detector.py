@@ -101,3 +101,40 @@ def test_other_indicators_are_unchanged_for_single_source():
     distributed = next(item for item in result.indicators if item.name == "distributed-source anomaly")
     assert packet_rate.triggered is True
     assert distributed.triggered is False
+
+
+def test_empty_baseline_stays_in_warmup():
+    engine = BaselineEngine(history_windows=10, minimum_samples=2)
+    result = analyze_window(make_metric(1000, 200000, 50, 50, 10, 1), engine)
+    assert result.classification == "NORMAL"
+    assert result.triggered_indicators == []
+    assert "warm-up" in result.reason
+
+
+def test_packet_and_byte_burst_without_strong_signal_is_not_high_risk():
+    engine = BaselineEngine(history_windows=10, minimum_samples=2)
+    engine.update(make_metric(100, 20000, 5, 5, 1, 1), is_anomalous=False)
+    engine.update(make_metric(100, 20000, 5, 5, 1, 1), is_anomalous=False)
+    result = analyze_window(make_metric(1000, 200000, 5, 5, 1, 1), engine)
+    assert result.classification == "SUSPICIOUS"
+
+
+def test_multi_source_flood_with_protocol_signals_is_high_risk():
+    engine = BaselineEngine(history_windows=10, minimum_samples=2)
+    engine.update(make_metric(100, 20000, 5, 5, 1, 1), is_anomalous=False)
+    engine.update(make_metric(100, 20000, 5, 5, 1, 1), is_anomalous=False)
+    result = analyze_window(make_metric(1200, 240000, 80, 80, 10, 1, dest_concentration=1.0), engine)
+    assert result.classification == "HIGH_RISK"
+    assert len(result.triggered_indicators) >= 3
+    assert all(item.explanation and item.threshold > 0 for item in result.indicators)
+
+
+def test_high_risk_recovers_to_normal_after_spike():
+    engine = BaselineEngine(history_windows=10, minimum_samples=2)
+    normal = make_metric(100, 20000, 5, 5, 1, 1)
+    engine.update(normal, is_anomalous=False)
+    engine.update(normal, is_anomalous=False)
+    spike = analyze_window(make_metric(1200, 240000, 80, 80, 10, 1, dest_concentration=1.0), engine)
+    assert spike.classification == "HIGH_RISK"
+    recovery = analyze_window(normal, engine)
+    assert recovery.classification == "NORMAL"

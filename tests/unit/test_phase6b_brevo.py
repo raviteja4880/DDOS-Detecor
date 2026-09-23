@@ -1,5 +1,7 @@
 import sys
 import pathlib
+import pytest
+import logging
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
@@ -14,7 +16,8 @@ def test_brevo_send_and_cooldown(monkeypatch):
     ALERT_LAST_SENT.clear()
 
     # enable email via alert_cfg
-    cfg = {"email": {"enabled": True, "provider": "brevo", "to": "ops@example.local"}, "cooldown_seconds": 0}
+    cfg = {"email": {"enabled": True, "provider": "brevo", "to": "ops@example.local"}, "cooldown_seconds": 60}
+    current_time = [100.0]
 
     posted = {"count": 0, "last": None}
 
@@ -35,18 +38,17 @@ def test_brevo_send_and_cooldown(monkeypatch):
     monkeypatch.setenv('BREVO_SENDER_EMAIL', 'sender@example.local')
     monkeypatch.setenv('BREVO_ALERT_RECIPIENT', 'ops@example.local')
 
-    alert = maybe_emit_alert('HIGH_RISK', 0.99, ['test'], current_metrics={'packets_per_sec': 1000}, baseline={'packets_per_sec': 100}, alert_cfg=cfg)
+    alert = maybe_emit_alert('HIGH_RISK', 0.99, ['test'], current_metrics={'packets_per_sec': 1000}, baseline={'packets_per_sec': 100}, alert_cfg=cfg, clock=lambda: current_time[0])
     assert alert is not None
     assert posted['count'] == 1
 
     # cooldown should prevent immediate resend
-    maybe_emit_alert('HIGH_RISK', 0.99, ['test'], alert_cfg={'email': {'enabled': True, 'provider': 'brevo', 'to': 'ops@example.local'}, 'cooldown_seconds': 60})
+    maybe_emit_alert('HIGH_RISK', 0.99, ['test'], alert_cfg=cfg, clock=lambda: current_time[0])
     assert posted['count'] == 1
 
     # simulate expiry
-    key = 'HIGH_RISK|test'
-    ALERT_LAST_SENT[key] = ALERT_LAST_SENT.get(key, 0) - 61
-    maybe_emit_alert('HIGH_RISK', 0.99, ['test'], alert_cfg={'email': {'enabled': True, 'provider': 'brevo', 'to': 'ops@example.local'}, 'cooldown_seconds': 60})
+    current_time[0] = 161.0
+    maybe_emit_alert('HIGH_RISK', 0.99, ['test'], alert_cfg=cfg, clock=lambda: current_time[0])
     assert posted['count'] == 2
 
 
@@ -109,3 +111,172 @@ def test_brevo_payload_contains_contextual_incident_details(monkeypatch):
     assert "Packet rate" in html
     assert "192.168.1.25" in html
     assert "nftables" in html
+
+
+@pytest.mark.parametrize("status_code", [401, 403, 429, 500])
+def test_brevo_http_errors_do_not_raise(monkeypatch, status_code, caplog):
+    ALERT_LAST_SENT.clear()
+    monkeypatch.setenv("BREVO_API_KEY", "DUMMY")
+    monkeypatch.setenv("BREVO_SENDER_EMAIL", "sender@example.local")
+    monkeypatch.setenv("BREVO_SENDER_NAME", "Alert")
+    monkeypatch.setenv("BREVO_ALERT_RECIPIENT", "ops@example.local")
+
+    class Response:
+        def __init__(self):
+            self.status_code = status_code
+
+    monkeypatch.setattr(requests, "post", lambda *args, **kwargs: Response())
+    alert = maybe_emit_alert(
+        "HIGH_RISK",
+        0.9,
+        ["test"],
+        alert_cfg={"email": {"enabled": True, "provider": "brevo"}, "cooldown_seconds": 0},
+    )
+    assert alert is not None
+    assert f"BREVO_RESPONSE_STATUS={status_code}" in caplog.text
+    assert "EMAIL_DELIVERED=false" in caplog.text
+
+
+def test_brevo_timeout_does_not_raise(monkeypatch, caplog):
+    ALERT_LAST_SENT.clear()
+    monkeypatch.setenv("BREVO_API_KEY", "DUMMY")
+    monkeypatch.setenv("BREVO_SENDER_EMAIL", "sender@example.local")
+    monkeypatch.setenv("BREVO_ALERT_RECIPIENT", "ops@example.local")
+
+    def fail(*args, **kwargs):
+        raise requests.Timeout("timed out")
+
+    monkeypatch.setattr(requests, "post", fail)
+    maybe_emit_alert(
+        "HIGH_RISK",
+        0.9,
+        ["test"],
+        alert_cfg={"email": {"enabled": True, "provider": "brevo"}, "cooldown_seconds": 0},
+    )
+    assert "monitoring continues" in caplog.text
+
+
+def test_brevo_diagnostics_show_first_attempt_and_cooldown(monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    ALERT_LAST_SENT.clear()
+    monkeypatch.setenv("BREVO_API_KEY", "DUMMY")
+    monkeypatch.setenv("BREVO_SENDER_EMAIL", "sender@example.local")
+    monkeypatch.setenv("BREVO_ALERT_RECIPIENT", "ops@example.local")
+    calls = {"count": 0}
+
+    class Response:
+        status_code = 201
+
+    def fake_post(*args, **kwargs):
+        calls["count"] += 1
+        return Response()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    cfg = {"email": {"enabled": True, "provider": "brevo"}, "cooldown_seconds": 60}
+    maybe_emit_alert("HIGH_RISK", 0.9, ["diagnostic"], alert_cfg=cfg)
+    maybe_emit_alert("HIGH_RISK", 0.9, ["diagnostic"], alert_cfg=cfg)
+    assert calls["count"] == 1
+    assert "EMAIL_COOLDOWN_ALLOWED=true" in caplog.text
+    assert "EMAIL_ATTEMPTED=true" in caplog.text
+    assert "BREVO_RESPONSE_STATUS=201" in caplog.text
+    assert "EMAIL_DELIVERED/ACCEPTED=true" in caplog.text
+    assert "BREVO_RESPONSE_STATUS=cooldown" in caplog.text
+
+
+def test_global_cooldown_spans_classification_score_and_indicators(monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    ALERT_LAST_SENT.clear()
+    monkeypatch.setenv("BREVO_API_KEY", "DUMMY")
+    monkeypatch.setenv("BREVO_SENDER_EMAIL", "sender@example.local")
+    monkeypatch.setenv("BREVO_ALERT_RECIPIENT", "ops@example.local")
+    calls = {"count": 0}
+
+    class Response:
+        status_code = 201
+
+    monkeypatch.setattr(requests, "post", lambda *args, **kwargs: (calls.__setitem__("count", calls["count"] + 1) or Response()))
+    cfg = {"email": {"enabled": True, "provider": "brevo"}, "cooldown_seconds": 60}
+    context = {"interface": "lo", "target_ips": ["127.0.0.2"], "target_ports": [80], "source_ips": ["127.0.0.1"]}
+    current_time = [100.0]
+    maybe_emit_alert("HIGH_RISK", 0.92, ["packet-rate anomaly"], context=context, alert_cfg=cfg, clock=lambda: current_time[0])
+    maybe_emit_alert("HIGH_RISK", 0.83, ["byte-rate anomaly", "SYN-rate anomaly"], context={**context, "source_ips": ["127.0.0.3"]}, alert_cfg=cfg, clock=lambda: current_time[0])
+    maybe_emit_alert("SUSPICIOUS", 0.33, ["connection-rate anomaly"], context=context, alert_cfg=cfg, clock=lambda: current_time[0])
+    assert calls["count"] == 1
+    assert caplog.text.count('"classification": "HIGH_RISK"') == 2
+    assert caplog.text.count('"classification": "SUSPICIOUS"') == 1
+
+    current_time[0] = 160.0
+    maybe_emit_alert("HIGH_RISK", 0.91, ["new indicator"], context=context, alert_cfg=cfg, clock=lambda: current_time[0])
+    assert calls["count"] == 2
+
+
+def test_separate_incident_has_independent_cooldown(monkeypatch):
+    ALERT_LAST_SENT.clear()
+    import ddos_detector.alerts as alerts
+    calls = {"count": 0}
+    monkeypatch.setenv("BREVO_API_KEY", "DUMMY")
+    monkeypatch.setenv("BREVO_SENDER_EMAIL", "sender@example.local")
+    monkeypatch.setenv("BREVO_ALERT_RECIPIENT", "ops@example.local")
+
+    class Response:
+        status_code = 201
+
+    monkeypatch.setattr(requests, "post", lambda *args, **kwargs: (calls.__setitem__("count", calls["count"] + 1) or Response()))
+    cfg = {"email": {"enabled": True, "provider": "brevo"}, "cooldown_seconds": 60}
+    clock = lambda: 100.0
+    maybe_emit_alert("HIGH_RISK", 0.9, ["incident-a"], context={"interface": "lo", "target_ips": ["127.0.0.2"]}, alert_cfg=cfg, clock=clock)
+    maybe_emit_alert("HIGH_RISK", 0.9, ["incident-b"], context={"interface": "lo", "target_ips": ["127.0.0.3"]}, alert_cfg=cfg, clock=clock)
+    assert calls["count"] == 2
+    assert len(alerts.ALERT_LAST_SENT) == 2
+
+
+def test_delivery_failure_does_not_consume_cooldown(monkeypatch):
+    ALERT_LAST_SENT.clear()
+    monkeypatch.setenv("BREVO_API_KEY", "DUMMY")
+    monkeypatch.setenv("BREVO_SENDER_EMAIL", "sender@example.local")
+    monkeypatch.setenv("BREVO_ALERT_RECIPIENT", "ops@example.local")
+    calls = {"count": 0}
+
+    def fail_then_succeed(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise requests.Timeout("timeout")
+        class Response:
+            status_code = 201
+        return Response()
+
+    monkeypatch.setattr(requests, "post", fail_then_succeed)
+    cfg = {"email": {"enabled": True, "provider": "brevo"}, "cooldown_seconds": 60}
+    context = {"interface": "lo", "target_ips": ["127.0.0.2"]}
+    maybe_emit_alert("HIGH_RISK", 0.9, ["failure"], context=context, alert_cfg=cfg, clock=lambda: 100.0)
+    maybe_emit_alert("HIGH_RISK", 0.9, ["retry"], context=context, alert_cfg=cfg, clock=lambda: 101.0)
+    assert calls["count"] == 2
+    assert len(ALERT_LAST_SENT) == 1
+
+
+def test_brevo_network_and_malformed_responses_are_non_fatal(monkeypatch, caplog):
+    ALERT_LAST_SENT.clear()
+    secret = "super-secret-key"
+    monkeypatch.setenv("BREVO_API_KEY", secret)
+    monkeypatch.setenv("BREVO_SENDER_EMAIL", "sender@example.local")
+    monkeypatch.setenv("BREVO_ALERT_RECIPIENT", "ops@example.local")
+
+    monkeypatch.setattr(requests, "post", lambda *args, **kwargs: (_ for _ in ()).throw(
+        requests.ConnectionError(secret)
+    ))
+    maybe_emit_alert(
+        "HIGH_RISK", 0.9, ["test"],
+        alert_cfg={"email": {"enabled": True, "provider": "brevo"}, "cooldown_seconds": 0},
+    )
+    assert secret not in caplog.text
+
+    class MalformedResponse:
+        pass
+
+    ALERT_LAST_SENT.clear()
+    monkeypatch.setattr(requests, "post", lambda *args, **kwargs: MalformedResponse())
+    maybe_emit_alert(
+        "HIGH_RISK", 0.9, ["test"],
+        alert_cfg={"email": {"enabled": True, "provider": "brevo"}, "cooldown_seconds": 0},
+    )
+    assert "monitoring continues" in caplog.text

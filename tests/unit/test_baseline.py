@@ -54,3 +54,12 @@ def test_baseline_history_is_bounded():
     for idx in range(5):
         baseline.update(make_metric(100 + idx, 50000 + idx * 1000, 7, 8, 5, 3), is_anomalous=False)
     assert len(baseline.history) == 2
+
+
+def test_extreme_clean_window_does_not_contaminate_baseline():
+    baseline = BaselineEngine(history_windows=5, minimum_samples=2)
+    baseline.update(make_metric(100, 50000, 7, 8, 2, 1), is_anomalous=False)
+    baseline.update(make_metric(110, 52000, 7, 8, 2, 1), is_anomalous=False)
+    assert baseline.update(make_metric(10000, 5000000, 700, 800, 100, 1), is_anomalous=False) is False
+    assert len(baseline.history) == 2
+    assert baseline.snapshot().mean["packets_per_sec"] < 200

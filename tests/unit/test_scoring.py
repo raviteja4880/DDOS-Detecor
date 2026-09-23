@@ -33,3 +33,39 @@ def test_score_and_classify_weights_are_respected():
     score, cls = score_and_classify(indicators, weights={"packet_rate": 1.0, "syn_rate": 1.0}, thresholds={"normal": 0.2, "suspicious": 0.6})
     assert 0.0 <= score <= 1.0
     assert cls in {"NORMAL", "SUSPICIOUS", "HIGH_RISK"}
+
+
+def test_high_risk_requires_corroborating_indicators():
+    indicators = [
+        IndicatorResult("packet-rate anomaly", 1000, 10, 100.0, True, "high"),
+        IndicatorResult("byte-rate anomaly", 100000, 1000, 100.0, True, "high"),
+    ]
+    score, classification = score_and_classify(
+        indicators,
+        weights={"packet_rate": 1.0, "byte_rate": 1.0},
+        thresholds={"normal": 0.2, "suspicious": 0.6},
+    )
+    assert score >= 0.6
+    assert classification == "SUSPICIOUS"
+
+
+def test_single_indicator_anomalies_remain_suspicious():
+    for name in ("packet-rate anomaly", "SYN-rate anomaly"):
+        indicators = [IndicatorResult(name, 1000, 10, 100.0, True, "high")]
+        _, classification = score_and_classify(
+            indicators,
+            weights={"packet_rate": 1.0, "syn_rate": 1.0},
+            thresholds={"normal": 0.2, "suspicious": 0.6},
+        )
+        assert classification == "SUSPICIOUS"
+
+
+def test_score_and_classify_is_deterministic():
+    indicators = [
+        IndicatorResult("packet-rate anomaly", 500, 10, 50.0, True, "high"),
+        IndicatorResult("SYN-rate anomaly", 100, 2, 50.0, True, "high"),
+        IndicatorResult("distributed-source anomaly", 20, 2, 10.0, True, "high"),
+    ]
+    first = score_and_classify(indicators)
+    second = score_and_classify(indicators)
+    assert first == second

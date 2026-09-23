@@ -15,6 +15,7 @@ class IndicatorResult:
     deviation: float
     triggered: bool
     explanation: str
+    threshold: float = 1.25
 
 
 @dataclass
@@ -97,12 +98,26 @@ class TrafficDetector:
         triggered = [indicator for indicator in indicators if indicator.triggered]
         classified = "NORMAL"
         reason = "No anomaly detected; observed traffic remains within learned baseline values."
+        if not baseline.is_ready():
+            for indicator in indicators:
+                indicator.triggered = False
+                indicator.explanation += "; baseline warm-up"
+            return DetectionResult(
+                indicators=indicators,
+                reason="Baseline warm-up is incomplete; traffic is not classified yet.",
+            )
         if triggered and len(triggered) >= max(1, minimum_indicators):
             classified = "SUSPICIOUS"
             reason = "Multiple traffic characteristics exceed the learned baseline."
-        if len(triggered) >= max(2, minimum_indicators):
+        strong_names = {
+            "SYN-rate anomaly",
+            "connection-rate anomaly",
+            "distributed-source anomaly",
+        }
+        corroborated = any(item.name in strong_names for item in triggered)
+        if len(triggered) >= max(3, minimum_indicators) and corroborated:
             classified = "HIGH_RISK"
-            reason = "Multiple indicators indicate a high-risk distributed traffic pattern."
+            reason = "Multiple corroborating indicators indicate anomalous attack-like traffic behavior."
 
         result = DetectionResult(indicators=indicators, classification=classified, reason=reason)
         return result

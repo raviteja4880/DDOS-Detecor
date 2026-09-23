@@ -95,6 +95,22 @@ The score is computed from indicator deviations and weighted importance. It rema
 - `SUSPICIOUS`: some indicators exceed the learned baseline
 - `HIGH_RISK`: multiple indicators strongly suggest a distributed burst pattern
 
+An anomaly means that the observed traffic window differs materially from the
+learned statistical baseline; it is not proof that an IP or user is malicious.
+HIGH_RISK requires a sufficiently high reproducible score, at least three
+triggered indicators, and corroboration from a SYN, connection, or
+distributed-source signal. Live monitoring also requires the configured number
+of consecutive HIGH_RISK windows (two in the example configuration) before
+raising the high-risk classification. This reduces one-window spikes and
+packet/byte-only false positives while preserving explainable indicators.
+
+The baseline warms up before classification. Suspicious windows are excluded
+from baseline updates, and extreme outliers are rejected from otherwise clean
+baseline updates so a sudden spike does not immediately redefine normal
+traffic. Legitimate deployment bursts, downloads, health checks, or many
+simultaneous clients can still look anomalous; operators should interpret
+alerts as behavior requiring attention, not as a definitive attack verdict.
+
 ## 10. Simulation
 The simulator is intentionally constrained to safe, local-only scenarios.
 
@@ -393,6 +409,49 @@ Verify only whether each variable is set; these commands do not print secret val
 [ -n "$BREVO_ALERT_RECIPIENT" ] && echo "BREVO_ALERT_RECIPIENT: SET" || echo "BREVO_ALERT_RECIPIENT: NOT SET"
 ```
 
+The monitor also loads a project-local `.env` next to the repository when it
+starts. Existing process variables take precedence, and only the four Brevo
+variable names above are read; arbitrary system files are not searched. This
+allows the application to find the project credentials when started as root.
+The explicit `sudo -E` command below remains useful for preserving exported
+variables, but it is not the only supported path. If email is enabled and any
+required variable is missing, startup stops with a configuration error naming
+the missing variable (never its value). If email is disabled, Brevo variables
+are not required.
+
+### Temporary mitigation lifecycle
+
+Live nftables rules are detector-owned temporary rules. Each rule has a
+unique ID, creation/expiration timestamps, target, interface, reason, and
+active/expired/removed status in the application state. The rule comment is
+the exact ownership marker `ddos_detector:<rule-id>`.
+
+The configured `rule_ttl_seconds` is currently enforced by the application;
+direct filter rules are not created with an assumed native nftables timeout.
+This is intentional because nftables 1.0.9 in the supported WSL environment
+does not provide a verified portable timeout form for these rules. New rule
+IDs include their expiration epoch, allowing a fresh process to discover and
+remove expired detector rules. Run `cleanup --all` after an abnormal shutdown
+to remove detector-owned rules safely, or `cleanup` to remove expired rules.
+Cleanup lists only the detector table/chain, validates the complete ownership
+comment, tolerates already-removed rules, and never flushes or deletes
+unrelated firewall objects. Repeating cleanup is safe.
+
+Repeated high-risk behavior uses temporary mitigation rather than permanent
+blacklisting. When enabled, the first source/target block uses the configured
+initial TTL (60 seconds in the example), later offenses for that same
+source/target/interface escalate by the configured factor up to the configured
+maximum (300 seconds in the example). An active block is reused rather than
+duplicated. New source IPs are tracked independently and the existing
+`max_auto_block_sources` limit still applies per detection window.
+
+Offender history is bounded and in-memory only; it expires after
+`history_ttl_seconds` and resets on process restart. Active nftables rules
+remain detector-owned and discoverable after restart, so cleanup can remove
+them safely. Brevo alert cooldown/deduplication remains independent of
+mitigation history and prevents repeated identical alert emails within its
+configured cooldown.
+
 ### Step 6: Clean detector-owned nftables rules
 
 Before a fresh demonstration, remove only mitigation rules owned by this project:
@@ -401,13 +460,9 @@ Before a fresh demonstration, remove only mitigation rules owned by this project
 sudo .venv-linux/bin/python -m ddos_detector cleanup --all
 ```
 
-Do **not** run:
-
-```bash
-sudo nft flush ruleset
-```
-
-That command can remove unrelated firewall rules.
+Never use a broad nftables ruleset flush command; it can remove unrelated
+firewall rules. Use the detector cleanup command above, which removes only
+detector-owned rules.
 
 ### Step 7: Start the local test server
 

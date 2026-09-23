@@ -103,7 +103,11 @@ def test_live_linux_nftables_flow(monkeypatch):
     def fake_run(cmd, shell=False, capture_output=False, text=None, check=False):
         calls.append(cmd)
         if cmd[:3] == ["nft", "-j", "list"]:
-            payload = {"nftables": [{"chain": {"table": "ddos_detector", "name": "input", "rules": [{"handle": 14, "comment": "ddos_detector:live-1"}]}}]}
+            add_calls = [call for call in calls if call[1:3] == ["add", "rule"]]
+            if not add_calls:
+                return Completed(stdout=json.dumps({"nftables": []}))
+            add_rule = add_calls[-1]
+            payload = {"nftables": [{"chain": {"table": "ddos_detector", "name": "input", "rules": [{"handle": 14, "comment": add_rule[-1].strip('"')}]}}]}
             return Completed(stdout=json.dumps(payload))
         return Completed()
 
@@ -119,7 +123,7 @@ def test_live_linux_nftables_flow(monkeypatch):
     assert result["success"] is True
     assert manager.rules[0].status == "active"
     assert any(cmd[:4] == ["nft", "add", "table", "inet"] for cmd in calls)
-    assert any(arg == '"ddos_detector:live-1"' for cmd in calls for arg in cmd)
+    assert any(arg.startswith('"ddos_detector:live-') for cmd in calls for arg in cmd)
 
 
 def test_nft_rule_handles_parse_rule_objects_and_ignore_chain_handle(monkeypatch):
@@ -213,6 +217,52 @@ def test_cleanup_removes_only_tracked_nftables_rule(monkeypatch):
     assert removed == ["live-1"]
     assert not manager.rules
     assert any(cmd[:4] == ["nft", "delete", "rule", "inet"] for cmd in calls)
+
+
+def test_cleanup_expired_recovers_expired_rule_after_restart(monkeypatch):
+    calls = []
+    expires = int(__import__("time").time()) - 10
+
+    class Completed:
+        returncode = 0
+        stderr = ""
+        stdout = json.dumps({
+            "nftables": [{
+                "rule": {
+                    "table": "ddos_detector",
+                    "chain": "input",
+                    "handle": 20,
+                    "comment": f"ddos_detector:source-live-{expires}-abcdef123456",
+                }
+            }]
+        })
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return Completed()
+
+    monkeypatch.setattr("ddos_detector.mitigation.os.name", "posix", raising=False)
+    monkeypatch.setattr("ddos_detector.mitigation.platform.system", lambda: "Linux", raising=False)
+    monkeypatch.setattr("ddos_detector.mitigation.MitigationManager._tool_available", lambda self, tool: tool == "nft")
+    monkeypatch.setattr("ddos_detector.mitigation.subprocess.run", fake_run)
+    manager = MitigationManager({"enabled": True, "dry_run": False, "mechanism": "nftables"})
+    assert manager.cleanup_expired()
+    assert any(cmd[1:3] == ["delete", "rule"] for cmd in calls)
+
+
+def test_cleanup_already_deleted_rule_is_idempotent(monkeypatch):
+    class Completed:
+        returncode = 1
+        stdout = ""
+        stderr = "No such file or directory"
+
+    monkeypatch.setattr("ddos_detector.mitigation.os.name", "posix", raising=False)
+    monkeypatch.setattr("ddos_detector.mitigation.platform.system", lambda: "Linux", raising=False)
+    monkeypatch.setattr("ddos_detector.mitigation.MitigationManager._tool_available", lambda self, tool: True)
+    monkeypatch.setattr("ddos_detector.mitigation.subprocess.run", lambda *args, **kwargs: Completed())
+    manager = MitigationManager({"enabled": True, "dry_run": False, "mechanism": "nftables"})
+    assert manager.cleanup_all() == []
+    assert manager.last_cleanup_error is None
 
 
 def test_monitor_rejects_windows_live_capture(monkeypatch, capsys):

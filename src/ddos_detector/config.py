@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from ipaddress import ip_address
 from typing import Any, Dict
 import logging
+from .environment import load_project_environment, missing_brevo_variables
 
 try:
     import yaml
@@ -23,7 +24,7 @@ class Config:
     scoring: Dict[str, Any] = field(default_factory=lambda: {"weights": {"syn_rate": 1.0, "packet_rate": 0.8, "distributed_source": 1.0, "connection_rate": 0.7, "dest_concentration": 0.5}, "thresholds": {"normal": 0.2, "suspicious": 0.6}})
     simulation: Dict[str, Any] = field(default_factory=lambda: {"enabled": True, "mode": "normal", "rate_limit": 1000, "packet_limit": 50000, "target": "127.0.0.1", "max_sources": 20})
     alerts: Dict[str, Any] = field(default_factory=lambda: {"enabled": True, "console": True, "structured_logging": True, "email": {"enabled": False, "provider": "brevo", "cooldown_seconds": 60}})
-    mitigation: Dict[str, Any] = field(default_factory=lambda: {"enabled": False, "dry_run": True, "mechanism": "nftables", "rule_ttl_seconds": 60, "auto_block_sources": False, "max_auto_block_sources": 5})
+    mitigation: Dict[str, Any] = field(default_factory=lambda: DEFAULT_MITIGATION.copy())
 
 
 DEFAULT_CAPTURE = {"bpf_filter": "", "snaplen": 262144}
@@ -35,7 +36,30 @@ DEFAULT_DETECTION = {"minimum_indicators": 2, "minimum_consecutive_windows": 1}
 DEFAULT_SCORING = {"weights": DEFAULT_WEIGHTS.copy(), "thresholds": DEFAULT_THRESHOLDS.copy()}
 DEFAULT_SIMULATION = {"enabled": True, "mode": "normal", "rate_limit": 1000, "packet_limit": 50000, "target": "127.0.0.1", "max_sources": 20}
 DEFAULT_ALERTS = {"enabled": True, "console": True, "structured_logging": True, "email": {"enabled": False, "provider": "brevo", "cooldown_seconds": 60}}
-DEFAULT_MITIGATION = {"enabled": False, "dry_run": True, "mechanism": "nftables", "rule_ttl_seconds": 60, "auto_block_sources": False, "max_auto_block_sources": 5}
+DEFAULT_MITIGATION = {
+    "enabled": False,
+    "dry_run": True,
+    "mechanism": "nftables",
+    "rule_ttl_seconds": 60,
+    "auto_block_sources": False,
+    "max_auto_block_sources": 5,
+    "excluded_sources": [],
+    "attributable_sources": [],
+    "shared_source_networks": [
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "100.64.0.0/10",
+    ],
+    "repeated_offender": {
+        "enabled": True,
+        "initial_ttl_seconds": 60,
+        "escalation_factor": 2.0,
+        "max_ttl_seconds": 300,
+        "history_ttl_seconds": 3600,
+        "max_history_entries": 100,
+    },
+}
 
 
 def _is_safe_local_target(target: str) -> bool:
@@ -141,6 +165,16 @@ def validate_config(cfg: Config) -> Config:
 
     if not isinstance(cfg.alerts.get("enabled", True), bool):
         raise ValueError("Configuration error: alerts.enabled must be boolean")
+    email_cfg = cfg.alerts.get("email", {}) or {}
+    if not isinstance(email_cfg, dict):
+        raise ValueError("Configuration error: alerts.email must be a dictionary")
+    if bool(email_cfg.get("enabled", False)) and str(email_cfg.get("provider", "brevo")).lower() == "brevo":
+        missing = missing_brevo_variables()
+        if missing:
+            logging.getLogger("ddos_detector").warning(
+                "EMAIL_CONFIGURATION_VALID=false missing=%s; monitoring continues without Brevo delivery",
+                ",".join(missing),
+            )
     if not isinstance(cfg.mitigation.get("enabled", False), bool):
         raise ValueError("Configuration error: mitigation.enabled must be boolean")
     if not isinstance(cfg.mitigation.get("dry_run", True), bool):
@@ -158,12 +192,45 @@ def validate_config(cfg: Config) -> Config:
     max_auto = int(cfg.mitigation.get("max_auto_block_sources", DEFAULT_MITIGATION["max_auto_block_sources"]))
     if max_auto <= 0 or max_auto > 100:
         raise ValueError("Configuration error: mitigation.max_auto_block_sources must be between 1 and 100")
+    excluded_sources = cfg.mitigation.get("excluded_sources", DEFAULT_MITIGATION["excluded_sources"]) or []
+    if not isinstance(excluded_sources, list):
+        raise ValueError("Configuration error: mitigation.excluded_sources must be a list")
+    for item in excluded_sources:
+        if not isinstance(item, str):
+            raise ValueError("Configuration error: mitigation.excluded_sources entries must be strings")
+        try:
+            ip_address(item)
+        except ValueError:
+            try:
+                from ipaddress import ip_network
+                ip_network(item, strict=False)
+            except ValueError as exc:
+                raise ValueError(f"Configuration error: mitigation.excluded_sources contains invalid value '{item}'") from exc
+    repeated = cfg.mitigation.get("repeated_offender", DEFAULT_MITIGATION["repeated_offender"])
+    if not isinstance(repeated, dict):
+        raise ValueError("Configuration error: mitigation.repeated_offender must be a dictionary")
+    repeated_initial = int(repeated.get("initial_ttl_seconds", ttl))
+    repeated_max = int(repeated.get("max_ttl_seconds", repeated_initial))
+    repeated_factor = float(repeated.get("escalation_factor", 2.0))
+    repeated_history_ttl = int(repeated.get("history_ttl_seconds", 3600))
+    repeated_max_history = int(repeated.get("max_history_entries", 100))
+    if not isinstance(repeated.get("enabled", True), bool):
+        raise ValueError("Configuration error: mitigation.repeated_offender.enabled must be boolean")
+    if repeated_initial <= 0 or repeated_max < repeated_initial or repeated_max > 86400:
+        raise ValueError("Configuration error: mitigation.repeated_offender TTL values are invalid")
+    if repeated_factor < 1.0 or repeated_factor > 10.0:
+        raise ValueError("Configuration error: mitigation.repeated_offender.escalation_factor must be between 1 and 10")
+    if repeated_history_ttl <= 0 or repeated_history_ttl > 604800:
+        raise ValueError("Configuration error: mitigation.repeated_offender.history_ttl_seconds must be between 1 and 604800")
+    if repeated_max_history <= 0 or repeated_max_history > 1000:
+        raise ValueError("Configuration error: mitigation.repeated_offender.max_history_entries must be between 1 and 1000")
     return cfg
 
 
 def load_config(path: str) -> Config:
     """Load YAML config if available, otherwise return defaults."""
     cfg = Config()
+    load_project_environment(path)
     try:
         if yaml is not None:
             with open(path, "r", encoding="utf-8") as f:

@@ -6,7 +6,7 @@ import pathlib
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
-from ddos_detector.alerts import maybe_emit_alert, ALERT_LAST_SENT
+from ddos_detector.alerts import maybe_emit_alert, ALERT_LAST_SENT, _incident_key
 
 
 class DummySMTP:
@@ -88,7 +88,7 @@ def test_maybe_emit_alert_respects_cooldown(monkeypatch):
 
     # after cooldown, sending should work
     # simulate time advance
-    key = "SUSPICIOUS|a"
+    key = _incident_key(None)
     ALERT_LAST_SENT[key] = time.time() - 61
     maybe_emit_alert("SUSPICIOUS", 0.82, ["a"], alert_cfg=cfg)
     assert sends['count'] == 2

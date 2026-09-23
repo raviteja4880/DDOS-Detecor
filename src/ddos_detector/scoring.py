@@ -63,6 +63,13 @@ def classify_score(score: float, thresholds: Dict[str, float] | None = None) -> 
 
 
 def score_and_classify(indicators: Iterable[IndicatorResult], weights: Dict[str, float] | None = None, thresholds: Dict[str, float] | None = None) -> tuple[float, str]:
-    score = score_indicators(indicators, weights=weights)
+    indicator_list = list(indicators)
+    score = score_indicators(indicator_list, weights=weights)
     classification = classify_score(score, thresholds=thresholds)
+    triggered = [item for item in indicator_list if item.triggered]
+    strong_names = {"SYN-rate anomaly", "connection-rate anomaly", "distributed-source anomaly"}
+    if classification == "HIGH_RISK" and (
+        len(triggered) < 3 or not any(item.name in strong_names for item in triggered)
+    ):
+        classification = "SUSPICIOUS"
     return score, classification

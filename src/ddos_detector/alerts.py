@@ -53,11 +53,14 @@ def emit_console_alert(alert: Dict[str, Any]) -> None:
 
 import os
 import smtplib
+import threading
 import time
 from email.message import EmailMessage
+from typing import Callable
 
-# Simple in-memory cooldown/dedup store: key -> last_sent_epoch
+# In-memory incident-scoped cooldown store: stable incident key -> last accepted epoch.
 ALERT_LAST_SENT: Dict[str, float] = {}
+ALERT_COOLDOWN_LOCK = threading.RLock()
 
 
 def _incident_data(alert: Dict[str, Any]) -> Dict[str, Any]:
@@ -80,6 +83,8 @@ def _incident_data(alert: Dict[str, Any]) -> Dict[str, Any]:
         ("Connection rate", "connection_rate", "connections/sec"),
         ("Unique sources", "unique_src_ips", "sources"),
         ("Destination concentration", "dest_concentration", "share"),
+        ("Average packet size", "avg_packet_size", "bytes"),
+        ("Burst intensity", "burst_intensity", "ratio"),
     ]
     comparisons = []
     for label, key, unit in metrics:
@@ -153,6 +158,9 @@ def format_alert_email(alert: Dict[str, Any]) -> str:
             f"- Maximum sources blocked: {mitigation.get('max_auto_block_sources', 'Unavailable')} per detection window",
             f"- Rule lifetime: {mitigation.get('rule_ttl_seconds', 'Unavailable')} seconds (TTL)",
             f"- Applied rules: {', '.join(map(str, mitigation.get('applied_rules', []))) if mitigation.get('applied_rules') else 'None reported'}",
+            f"- Decision: {mitigation.get('decision', 'Detected but not automatically blocked')}",
+            f"- Decision reason: {mitigation.get('reason', 'No automatic mitigation decision was recorded.')}",
+            f"- Shared/NAT ambiguity: {'YES' if mitigation.get('shared_nat_ambiguous') else 'NO'}",
             "",
             "Triggered indicators: " + ", ".join(data["reasons"]),
             "This notification was generated automatically by the DDoS detection engine.",
@@ -191,12 +199,15 @@ def format_alert_email_html(alert: Dict[str, Any]) -> str:
 <b>Mechanism:</b> {esc(mitigation.get("mechanism", "Unavailable"))}<br>
 <b>Maximum sources blocked:</b> {esc(mitigation.get("max_auto_block_sources", "Unavailable"))} per detection window<br>
 <b>Rule TTL:</b> {esc(mitigation.get("rule_ttl_seconds", "Unavailable"))} seconds<br>
-<b>Applied rule(s):</b> {esc(", ".join(map(str, applied)) if applied else "None reported")}</p>
+<b>Applied rule(s):</b> {esc(", ".join(map(str, applied)) if applied else "None reported")}<br>
+<b>Decision:</b> {esc(mitigation.get("decision", "Detected but not automatically blocked"))}<br>
+<b>Decision reason:</b> {esc(mitigation.get("reason", "No automatic mitigation decision was recorded."))}<br>
+<b>Shared/NAT ambiguity:</b> {"YES" if mitigation.get("shared_nat_ambiguous") else "NO"}</p>
 <p style="font-size:12px;color:#657184">This notification was generated automatically by the DDoS detection engine.</p>
 </div></div></body></html>"""
 
 
-def _send_email_via_smtp(alert: Dict[str, Any], smtp_config: Dict[str, Any]) -> None:
+def _send_email_via_smtp(alert: Dict[str, Any], smtp_config: Dict[str, Any]) -> Dict[str, Any]:
     host = smtp_config.get("host") or os.environ.get("SMTP_HOST")
     port = int(smtp_config.get("port") or os.environ.get("SMTP_PORT", 25))
     user = smtp_config.get("user") or os.environ.get("SMTP_USER")
@@ -205,7 +216,7 @@ def _send_email_via_smtp(alert: Dict[str, Any], smtp_config: Dict[str, Any]) -> 
     to_addrs = smtp_config.get("to") or os.environ.get("SMTP_TO")
     if not host or not from_addr or not to_addrs:
         logger.warning("SMTP not configured properly; skipping email send")
-        return
+        return {"attempted": False, "configuration_valid": False, "delivered": False, "status": "not_requested", "reason": "missing_configuration"}
     if isinstance(to_addrs, str):
         to_addrs = [addr.strip() for addr in to_addrs.split(",") if addr.strip()]
 
@@ -227,25 +238,47 @@ def _send_email_via_smtp(alert: Dict[str, Any], smtp_config: Dict[str, Any]) -> 
         smtp.send_message(msg)
         smtp.quit()
         logger.info("Alert email sent via SMTP to %s", to_addrs)
+        return {"attempted": True, "configuration_valid": True, "delivered": True, "status": "accepted", "reason": "accepted"}
     except Exception as exc:
         logger.exception("Failed to send alert email: %s", exc)
+        return {"attempted": True, "configuration_valid": True, "delivered": False, "status": "send_failed", "reason": "delivery_failure"}
 
 
-def _send_email_via_brevo(alert: Dict[str, Any], brevo_config: Dict[str, Any]) -> None:
+def _incident_key(context: Dict[str, Any] | None) -> str:
+    """Build a stable identity from destination context, excluding volatile alert data."""
+    context = context or {}
+    interface = str(context.get("interface") or "unknown")
+    targets = tuple(sorted(str(item) for item in (context.get("target_ips") or [])))
+    ports = tuple(sorted(str(item) for item in (context.get("target_ports") or [])))
+    return json.dumps({"interface": interface, "target_ips": targets, "target_ports": ports}, sort_keys=True)
+
+
+def _send_email_via_brevo(alert: Dict[str, Any], brevo_config: Dict[str, Any]) -> Dict[str, Any]:
     # Use requests to post to Brevo transactional smtp endpoint
     try:
         import requests
     except Exception:
-        logger.warning("requests library not available; cannot send Brevo email")
-        return
+        logger.error("EMAIL_ATTEMPTED=true BREVO_RESPONSE_STATUS=unavailable EMAIL_DELIVERED=false reason=requests_dependency_missing")
+        return {"attempted": False, "configuration_valid": False, "delivered": False, "status": "unavailable", "reason": "requests_dependency_missing"}
 
     api_key = brevo_config.get("api_key") or os.environ.get("BREVO_API_KEY")
     sender_email = brevo_config.get("from") or os.environ.get("BREVO_SENDER_EMAIL")
     sender_name = brevo_config.get("from_name") or os.environ.get("BREVO_SENDER_NAME")
     to_addr = brevo_config.get("to") or os.environ.get("BREVO_ALERT_RECIPIENT")
     if not api_key or not sender_email or not to_addr:
-        logger.warning("Brevo not configured properly; skipping email send")
-        return
+        missing = [
+            name for name, value in (
+                ("BREVO_API_KEY", api_key),
+                ("BREVO_SENDER_EMAIL", sender_email),
+                ("BREVO_ALERT_RECIPIENT", to_addr),
+            ) if not value
+        ]
+        logger.error(
+            "EMAIL_ATTEMPTED=false BREVO_RESPONSE_STATUS=not_requested EMAIL_DELIVERED=false "
+            "EMAIL_CONFIGURATION_VALID=false reason=missing_configuration missing=%s",
+            ",".join(missing),
+        )
+        return {"attempted": False, "configuration_valid": False, "delivered": False, "status": "not_requested", "reason": "missing_configuration"}
     if isinstance(to_addr, str):
         to_addr = [addr.strip() for addr in to_addr.split(",") if addr.strip()]
 
@@ -263,11 +296,33 @@ def _send_email_via_brevo(alert: Dict[str, Any], brevo_config: Dict[str, Any]) -
     try:
         resp = requests.post(url, json=data, headers=headers, timeout=10)
         if resp.status_code >= 200 and resp.status_code < 300:
-            logger.info("Alert email sent via Brevo to %s", to_addr)
+            logger.info("EMAIL_ATTEMPTED=true BREVO_RESPONSE_STATUS=%s EMAIL_DELIVERED=true reason=accepted", resp.status_code)
+            return {"attempted": True, "configuration_valid": True, "delivered": True, "status": resp.status_code, "reason": "accepted"}
+        elif resp.status_code == 401:
+            logger.error("EMAIL_ATTEMPTED=true BREVO_RESPONSE_STATUS=401 EMAIL_DELIVERED=false reason=authentication_failed")
+        elif resp.status_code == 403:
+            logger.error("EMAIL_ATTEMPTED=true BREVO_RESPONSE_STATUS=403 EMAIL_DELIVERED=false reason=sender_or_ip_forbidden")
+        elif resp.status_code == 429:
+            logger.warning("EMAIL_ATTEMPTED=true BREVO_RESPONSE_STATUS=429 EMAIL_DELIVERED=false reason=rate_limited")
+        elif 400 <= resp.status_code < 500:
+            logger.error("EMAIL_ATTEMPTED=true BREVO_RESPONSE_STATUS=%s EMAIL_DELIVERED=false reason=client_rejected", resp.status_code)
+        elif 500 <= resp.status_code:
+            logger.error("EMAIL_ATTEMPTED=true BREVO_RESPONSE_STATUS=%s EMAIL_DELIVERED=false reason=brevo_server_error", resp.status_code)
         else:
-            logger.error("Brevo API returned %s: %s", resp.status_code, resp.text)
-    except Exception as exc:
-        logger.exception("Failed to send Brevo alert email: %s", exc)
+            logger.error("EMAIL_ATTEMPTED=true BREVO_RESPONSE_STATUS=%s EMAIL_DELIVERED=false reason=unexpected_status", resp.status_code)
+        return {"attempted": True, "configuration_valid": True, "delivered": False, "status": resp.status_code, "reason": "request_rejected"}
+    except requests.Timeout:
+        logger.warning("EMAIL_ATTEMPTED=true BREVO_RESPONSE_STATUS=timeout EMAIL_DELIVERED=false reason=timeout; monitoring continues")
+        return {"attempted": True, "configuration_valid": True, "delivered": False, "status": "timeout", "reason": "timeout"}
+    except requests.RequestException:
+        logger.warning("EMAIL_ATTEMPTED=true BREVO_RESPONSE_STATUS=network_error EMAIL_DELIVERED=false reason=network_failure; monitoring continues")
+        return {"attempted": True, "configuration_valid": True, "delivered": False, "status": "network_error", "reason": "network_failure"}
+    except (AttributeError, TypeError, ValueError):
+        logger.warning("EMAIL_ATTEMPTED=true BREVO_RESPONSE_STATUS=invalid_response EMAIL_DELIVERED=false reason=invalid_response; monitoring continues")
+        return {"attempted": True, "configuration_valid": True, "delivered": False, "status": "invalid_response", "reason": "invalid_response"}
+    except Exception:
+        logger.warning("EMAIL_ATTEMPTED=true BREVO_RESPONSE_STATUS=unknown_error EMAIL_DELIVERED=false reason=delivery_failure; monitoring continues")
+        return {"attempted": True, "configuration_valid": True, "delivered": False, "status": "unknown_error", "reason": "delivery_failure"}
 
 
 def maybe_emit_alert(
@@ -278,6 +333,7 @@ def maybe_emit_alert(
     baseline: Dict[str, Any] | None = None,
     alert_cfg: Dict[str, Any] | None = None,
     context: Dict[str, Any] | None = None,
+    clock: Callable[[], float] | None = None,
 ) -> Dict[str, Any] | None:
     """Emit an alert to console/log and optionally via SMTP or Brevo.
 
@@ -324,21 +380,43 @@ def maybe_emit_alert(
         elif os.environ.get("SMTP_HOST"):
             email_provider = "smtp"
 
-    # Simple dedup/cooldown key based on classification + reasons
-    dedup_key = f"{alert.get('classification')}|{'|'.join(alert.get('reasons', []))}"
-    last_sent = ALERT_LAST_SENT.get(dedup_key, 0.0)
-    now = time.time()
+    incident_key = _incident_key(context)
+    now = (clock or time.time)()
 
-    if email_enabled:
-        if now - last_sent < cooldown_seconds:
-            logger.info("Skipping email send due to cooldown (%s seconds) for key=%s", cooldown_seconds, dedup_key)
-        else:
-            if (email_provider == "brevo"):
-                # send via Brevo
-                _send_email_via_brevo(alert, email_conf)
-            elif (email_provider == "smtp"):
-                _send_email_via_smtp(alert, email_conf)
+    email_configuration_valid = True
+    email_cooldown_allowed = False
+    email_attempted = False
+    email_result: Dict[str, Any] = {"delivered": False, "status": "not_enabled", "reason": "email_disabled"}
+    with ALERT_COOLDOWN_LOCK:
+        last_sent = ALERT_LAST_SENT.get(incident_key)
+        if email_enabled:
+            if last_sent is not None and now - last_sent < cooldown_seconds:
+                logger.info("Skipping email send due to cooldown (%s seconds) for incident=%s", cooldown_seconds, incident_key)
+                email_result = {"delivered": False, "status": "cooldown", "reason": "cooldown"}
             else:
-                logger.warning("No email provider configured; skipping email send")
-            ALERT_LAST_SENT[dedup_key] = now
+                email_cooldown_allowed = True
+                if email_provider == "brevo":
+                    email_result = _send_email_via_brevo(alert, email_conf)
+                    email_configuration_valid = bool(email_result.get("configuration_valid", False))
+                    email_attempted = bool(email_result.get("attempted", False))
+                elif email_provider == "smtp":
+                    email_result = _send_email_via_smtp(alert, email_conf)
+                    email_attempted = bool(email_result.get("attempted", False))
+                else:
+                    logger.warning("No email provider configured; skipping email send")
+                    email_configuration_valid = False
+                    email_result = {"delivered": False, "status": "not_configured", "reason": "provider_missing"}
+                # Delivery failures are retryable and do not consume the cooldown.
+                if email_result.get("delivered"):
+                    ALERT_LAST_SENT[incident_key] = now
+    logger.info(
+        "EMAIL_ENABLED=%s EMAIL_CONFIGURATION_VALID=%s EMAIL_COOLDOWN_ALLOWED=%s "
+        "EMAIL_ATTEMPTED=%s BREVO_RESPONSE_STATUS=%s EMAIL_DELIVERED/ACCEPTED=%s",
+        str(email_enabled).lower(),
+        str(email_configuration_valid).lower(),
+        str(email_cooldown_allowed).lower(),
+        str(email_attempted).lower(),
+        email_result.get("status"),
+        str(bool(email_result.get("delivered", False))).lower(),
+    )
     return alert

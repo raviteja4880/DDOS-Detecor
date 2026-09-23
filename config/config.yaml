@@ -55,3 +55,19 @@ mitigation:
   rule_ttl_seconds: 60
   auto_block_sources: true
   max_auto_block_sources: 5
+  excluded_sources: []
+  # Automatic source blocking requires explicit attribution. Shared/NAT
+  # networks remain alert-only to avoid disconnecting legitimate LAN users.
+  attributable_sources: []
+  shared_source_networks:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    - 100.64.0.0/10
+  repeated_offender:
+    enabled: true
+    initial_ttl_seconds: 60
+    escalation_factor: 2.0
+    max_ttl_seconds: 300
+    history_ttl_seconds: 3600
+    max_history_entries: 100

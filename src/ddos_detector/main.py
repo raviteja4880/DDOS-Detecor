@@ -179,10 +179,17 @@ def _run_monitor(args, cfg, capture_factory=None):
     )
     window_packets = []
     window_start = time.monotonic()
+    high_risk_streak = 0
+    mitigation_cfg = getattr(cfg, "mitigation", {}) or {}
+    mitigation_manager = MitigationManager(mitigation_cfg) if mitigation_cfg.get("enabled") else None
+    if mitigation_manager is not None:
+        mitigation_manager.cleanup_expired()
     print(f"Monitoring interface {interface} using passive capture. Press Ctrl+C to stop.")
     try:
         with capture_factory(interface, cfg.capture.get("bpf_filter", "")) as capture:
             while True:
+                if mitigation_manager is not None:
+                    mitigation_manager.cleanup_expired()
                 batch = capture.read_packets(count=100)
                 for packet in batch:
                     try:
@@ -218,6 +225,13 @@ def _run_monitor(args, cfg, capture_factory=None):
                     weights=cfg.scoring.get("weights", cfg.weights),
                     thresholds=cfg.scoring.get("thresholds", cfg.thresholds),
                 )
+                configured_consecutive = int(cfg.detection.get("minimum_consecutive_windows", 1))
+                if classification == "HIGH_RISK":
+                    high_risk_streak += 1
+                    if high_risk_streak < configured_consecutive:
+                        classification = "SUSPICIOUS"
+                else:
+                    high_risk_streak = 0
                 detection.score = float(score)
                 detection.classification = classification
 
@@ -245,40 +259,49 @@ def _run_monitor(args, cfg, capture_factory=None):
                     target_ips = sorted({packet.dst_ip for packet in raw_packets if packet.dst_ip})
                     target_ports = sorted({packet.dst_port for packet in raw_packets if packet.dst_port is not None})
                     mitigation_cfg = cfg.mitigation if isinstance(cfg.mitigation, dict) else {}
-                    alert = maybe_emit_alert(
-                        classification,
-                        float(score),
-                        reasons,
-                        current_metrics={
+                    mitigation_outcomes = []
+                    alert_context = {
+                        "interface": interface,
+                        "source_ips": source_ips,
+                        "target_ips": target_ips,
+                        "target_ports": target_ports,
+                        "mitigation": {
+                            "enabled": bool(mitigation_cfg.get("enabled", False)),
+                            "auto_block_sources": bool(mitigation_cfg.get("auto_block_sources", False)),
+                            "mechanism": mitigation_cfg.get("mechanism", "nftables"),
+                            "max_auto_block_sources": mitigation_cfg.get("max_auto_block_sources", 5),
+                            "rule_ttl_seconds": mitigation_cfg.get("rule_ttl_seconds", 60),
+                            "decision": "Detected but not automatically blocked",
+                            "reason": "Automatic mitigation is only allowed for explicitly attributable sources.",
+                            "shared_nat_ambiguous": True,
+                            "outcomes": mitigation_outcomes,
+                        },
+                    }
+                    alert_kwargs = {
+                        "classification": classification,
+                        "score": float(score),
+                        "reasons": reasons,
+                        "current_metrics": {
                             "packets_per_sec": window_metric.packets_per_sec,
                             "bytes_per_sec": window_metric.bytes_per_sec,
                             "syn_rate": window_metric.syn_packets / max(1, window_metric.window_seconds),
                             "connection_rate": window_metric.connection_attempts / max(1, window_metric.window_seconds),
                             "unique_src_ips": window_metric.unique_src_ips,
                             "dest_concentration": window_metric.dest_concentration,
+                            "avg_packet_size": window_metric.avg_packet_size,
+                            "burst_intensity": window_metric.burst_intensity,
+                            "source_distribution": source_ips,
                         },
-                        baseline={
+                        "baseline": {
                             "packets_per_sec": baseline_snapshot.mean.get("packets_per_sec", 0.0),
                             "bytes_per_sec": baseline_snapshot.mean.get("bytes_per_sec", 0.0),
                             "syn_rate": baseline_snapshot.mean.get("syn_packets", 0.0) / max(1, window_metric.window_seconds),
                             "connection_rate": baseline_snapshot.mean.get("connection_attempts", 0.0) / max(1, window_metric.window_seconds),
                             "unique_src_ips": baseline_snapshot.mean.get("unique_src_ips", 0.0),
                         },
-                        alert_cfg=getattr(cfg, "alerts", None) or cfg.alerts,
-                        context={
-                            "interface": interface,
-                            "source_ips": source_ips,
-                            "target_ips": target_ips,
-                            "target_ports": target_ports,
-                            "mitigation": {
-                                "enabled": bool(mitigation_cfg.get("enabled", False)),
-                                "auto_block_sources": bool(mitigation_cfg.get("auto_block_sources", False)),
-                                "mechanism": mitigation_cfg.get("mechanism", "nftables"),
-                                "max_auto_block_sources": mitigation_cfg.get("max_auto_block_sources", 5),
-                                "rule_ttl_seconds": mitigation_cfg.get("rule_ttl_seconds", 60),
-                            },
-                        },
-                    )
+                        "alert_cfg": getattr(cfg, "alerts", None) or cfg.alerts,
+                        "context": alert_context,
+                    }
 
                     # Optionally auto-block top source IPs for HIGH_RISK when configured
                     try:
@@ -289,31 +312,83 @@ def _run_monitor(args, cfg, capture_factory=None):
                         # Only perform mitigation when mitigation is enabled in config
                         mitig_cfg = cfg.mitigation if isinstance(cfg.mitigation, dict) else getattr(cfg, "mitigation", {})
                         if mitig_cfg.get("enabled"):
-                            from .mitigation import MitigationManager
-                            manager = MitigationManager(mitig_cfg)
+                            manager = mitigation_manager
+                            if manager is None:
+                                mitigation_outcomes.append({
+                                    "decision": "Detected but not automatically blocked",
+                                    "reason": "Mitigation manager is unavailable; no rule was created.",
+                                    "shared_nat_ambiguous": True,
+                                })
+                            else:
                             # select top source IPs from raw packet records
-                            srcs = [p.src_ip for p in (window_metric.raw or []) if getattr(p, 'src_ip', None)]
-                            from collections import Counter
-                            counts = Counter(srcs)
-                            limit = int(mitig_cfg.get("max_auto_block_sources", 5))
-                            blocked_this_window = 0
-                            for src, _ in counts.most_common():
-                                if blocked_this_window >= limit:
-                                    break
-                                try:
-                                    destinations = Counter(
-                                        p.dst_ip for p in (window_metric.raw or [])
-                                        if getattr(p, "src_ip", None) == src and getattr(p, "dst_ip", None)
-                                    )
-                                    target = destinations.most_common(1)[0][0] if destinations else None
-                                    if not target:
-                                        continue
-                                    result = manager.apply_source(src, target, interface, "auto-block from monitor HIGH_RISK")
-                                    if result.get("success"):
-                                        blocked_this_window += 1
-                                    print(f"Mitigation: {result.get('message')}")
-                                except Exception as exc:
-                                    print(f"Mitigation failed for {src}: {exc}")
+                                srcs = [p.src_ip for p in (window_metric.raw or []) if getattr(p, 'src_ip', None)]
+                                from collections import Counter
+                                counts = Counter(srcs)
+                                limit = int(mitig_cfg.get("max_auto_block_sources", 5))
+                                blocked_this_window = 0
+                                for src, _ in counts.most_common():
+                                    if blocked_this_window >= limit:
+                                        break
+                                    try:
+                                        attribution = manager.assess_source_attribution(src)
+                                        if not attribution["attributable"]:
+                                            mitigation_outcomes.append({
+                                                "source": src,
+                                                "decision": "Detected but not automatically blocked",
+                                                "reason": attribution["reason"],
+                                                "shared_nat_ambiguous": attribution["shared_or_nat"],
+                                            })
+                                            continue
+                                        destinations = Counter(
+                                            p.dst_ip for p in (window_metric.raw or [])
+                                            if getattr(p, "src_ip", None) == src and getattr(p, "dst_ip", None)
+                                        )
+                                        target = destinations.most_common(1)[0][0] if destinations else None
+                                        if not target:
+                                            continue
+                                        result = manager.apply_source(
+                                            src,
+                                            target,
+                                            interface,
+                                            "auto-block from monitor HIGH_RISK",
+                                            classification=classification,
+                                            score=float(score),
+                                        )
+                                        mitigation_outcomes.append({
+                                            "source": src,
+                                            "decision": "Detected and temporarily blocked" if result.get("success") else "Detected but not automatically blocked",
+                                            "reason": result.get("message", result.get("error", "Mitigation was not applied.")),
+                                            "shared_nat_ambiguous": False,
+                                            "result": result,
+                                        })
+                                        if result.get("success"):
+                                            blocked_this_window += 1
+                                        print(f"Mitigation: {result.get('message')}")
+                                    except Exception as exc:
+                                        mitigation_outcomes.append({
+                                            "source": src,
+                                            "decision": "Detected but not automatically blocked",
+                                            "reason": f"Mitigation failed safely: {exc}",
+                                            "shared_nat_ambiguous": False,
+                                        })
+                                        print(f"Mitigation failed for {src}: {exc}")
+                    if mitigation_outcomes:
+                        applied = [item for item in mitigation_outcomes if item["decision"] == "Detected and temporarily blocked"]
+                        alert_context["mitigation"]["decision"] = (
+                            "Detected and temporarily blocked" if applied else "Detected but not automatically blocked"
+                        )
+                        alert_context["mitigation"]["reason"] = "; ".join(
+                            sorted({item["reason"] for item in mitigation_outcomes})
+                        )
+                        alert_context["mitigation"]["shared_nat_ambiguous"] = any(
+                            item["shared_nat_ambiguous"] for item in mitigation_outcomes
+                        )
+                        alert_context["mitigation"]["applied_rules"] = [
+                            item["result"].get("rule_id")
+                            for item in applied
+                            if item.get("result", {}).get("rule_id")
+                        ]
+                    maybe_emit_alert(**alert_kwargs)
 
                 if classification in {"SUSPICIOUS", "HIGH_RISK"}:
                     print("Indicators:")
