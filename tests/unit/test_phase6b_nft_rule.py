@@ -18,7 +18,7 @@ def test_nft_rule_uses_saddr(monkeypatch):
 
     captured = {"add_rule_args": None}
 
-    def fake_subprocess_run(cmd, shell=False, capture_output=False, text=False, check=False):
+    def fake_subprocess_run(cmd, shell=False, capture_output=False, text=False, check=False, timeout=None):
         # cmd is a list; detect 'add rule' invocation
         if isinstance(cmd, list) and len(cmd) >= 5 and cmd[1] == 'add' and cmd[2] == 'rule':
             captured['add_rule_args'] = cmd

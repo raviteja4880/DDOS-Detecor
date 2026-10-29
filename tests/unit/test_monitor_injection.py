@@ -3,6 +3,8 @@ import os
 import types
 import time
 import tempfile
+import subprocess
+import select
 import pytest
 
 from contextlib import nullcontext
@@ -280,3 +282,49 @@ def test_monitor_instance_lock_rejects_duplicate_and_releases(monkeypatch):
 
         with _monitor_instance_lock("eth0"):
             pass
+
+
+def test_monitor_instance_lock_excludes_another_process_and_reuses_stale_lock_file(
+    monkeypatch, tmp_path
+):
+    if not sys.platform.startswith("linux"):
+        pytest.skip("fcntl process locking is Linux-specific")
+
+    from ddos_detector.main import _monitor_instance_lock
+
+    monkeypatch.setenv("DDOS_DETECTOR_LOCK_DIR", str(tmp_path))
+    child_code = (
+        "import time; "
+        "from ddos_detector.main import _monitor_instance_lock; "
+        "lock = _monitor_instance_lock('synthetic0'); "
+        "lock.__enter__(); "
+        "print('LOCK_HELD', flush=True); "
+        "time.sleep(30)"
+    )
+    child_env = os.environ.copy()
+    child_env["PYTHONPATH"] = os.pathsep.join(
+        [SRC_ROOT, child_env.get("PYTHONPATH", "")]
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", child_code],
+        env=child_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stdout is not None
+        ready, _, _ = select.select([process.stdout], [], [], 10)
+        assert ready, "child process did not acquire the monitor lock"
+        assert process.stdout.readline().strip() == "LOCK_HELD"
+        with pytest.raises(RuntimeError, match="already monitoring interface 'synthetic0'"):
+            with _monitor_instance_lock("synthetic0"):
+                pytest.fail("second process acquired the active interface lock")
+    finally:
+        process.terminate()
+        process.wait(timeout=10)
+
+    lock_files = list(tmp_path.glob("ddos_detector_*.lock"))
+    assert len(lock_files) == 1
+    with _monitor_instance_lock("synthetic0"):
+        pass

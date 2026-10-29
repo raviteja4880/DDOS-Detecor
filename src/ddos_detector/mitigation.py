@@ -14,6 +14,7 @@ from ipaddress import ip_address, ip_network
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+NFT_COMMAND_TIMEOUT_SECONDS = 5
 
 
 @dataclass
@@ -318,14 +319,10 @@ class MitigationManager:
         if not self._tool_available("nft"):
             return []
         try:
-            result = subprocess.run(
-                ["nft", "-j", "list", "chain", self.FAMILY, self.TABLE_NAME, self.CHAIN_NAME],
-                shell=False,
-                capture_output=True,
-                text=True,
-                check=False,
+            result = self._run_nft_command(
+                ["-j", "list", "chain", self.FAMILY, self.TABLE_NAME, self.CHAIN_NAME],
             )
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
             raise RuntimeError(f"Unable to inspect detector-owned nftables rules: {exc}") from exc
         if result.returncode != 0:
             stderr = (result.stderr or "").lower()
@@ -367,7 +364,19 @@ class MitigationManager:
         return handles
 
     def _run_nft_command(self, args: List[str], *, allow_exists: bool = False) -> subprocess.CompletedProcess[str]:
-        result = subprocess.run(["nft", *args], shell=False, capture_output=True, text=True, check=False)
+        try:
+            result = subprocess.run(
+                ["nft", *args],
+                shell=False,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=NFT_COMMAND_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"nft command timed out after {NFT_COMMAND_TIMEOUT_SECONDS} seconds"
+            ) from exc
         if allow_exists and result.returncode != 0:
             stderr = (result.stderr or "").lower()
             if "already exists" in stderr or "file exists" in stderr or "exists" in stderr:
@@ -437,12 +446,8 @@ class MitigationManager:
         if not handles:
             return {"success": True, "removed": False, "rule_id": rule.rule_id, "message": "No matching nftables rule found for this mitigation record."}
         for handle in handles:
-            result = subprocess.run(
-                ["nft", "delete", "rule", self.FAMILY, self.TABLE_NAME, self.CHAIN_NAME, "handle", str(handle)],
-                shell=False,
-                capture_output=True,
-                text=True,
-                check=False,
+            result = self._run_nft_command(
+                ["delete", "rule", self.FAMILY, self.TABLE_NAME, self.CHAIN_NAME, "handle", str(handle)]
             )
             if result.returncode != 0:
                 return {
@@ -464,12 +469,8 @@ class MitigationManager:
     def _discover_nft_application_rules(self) -> List[Dict[str, Any]]:
         if not self._is_linux() or not self._tool_available("nft"):
             return []
-        result = subprocess.run(
-            ["nft", "-j", "list", "chain", self.FAMILY, self.TABLE_NAME, self.CHAIN_NAME],
-            shell=False,
-            capture_output=True,
-            text=True,
-            check=False,
+        result = self._run_nft_command(
+            ["-j", "list", "chain", self.FAMILY, self.TABLE_NAME, self.CHAIN_NAME]
         )
         if result.returncode != 0:
             stderr = (result.stderr or "").lower()
@@ -817,12 +818,8 @@ class MitigationManager:
                 rule_id = rule_info["rule_id"]
                 if not self._rule_id_expired(rule_id, now):
                     continue
-                result = subprocess.run(
-                    ["nft", "delete", "rule", self.FAMILY, self.TABLE_NAME, self.CHAIN_NAME, "handle", str(rule_info["handle"])],
-                    shell=False,
-                    capture_output=True,
-                    text=True,
-                    check=False,
+                result = self._run_nft_command(
+                    ["delete", "rule", self.FAMILY, self.TABLE_NAME, self.CHAIN_NAME, "handle", str(rule_info["handle"])]
                 )
                 if result.returncode == 0 or "no such file" in (result.stderr or "").lower():
                     if rule_id not in removed:
@@ -856,12 +853,8 @@ class MitigationManager:
                 if rule_id in seen_rule_ids:
                     continue
                 seen_rule_ids.add(rule_id)
-                result = subprocess.run(
-                    ["nft", "delete", "rule", self.FAMILY, self.TABLE_NAME, self.CHAIN_NAME, "handle", str(rule_info["handle"])],
-                    shell=False,
-                    capture_output=True,
-                    text=True,
-                    check=False,
+                result = self._run_nft_command(
+                    ["delete", "rule", self.FAMILY, self.TABLE_NAME, self.CHAIN_NAME, "handle", str(rule_info["handle"])]
                 )
                 if result.returncode != 0:
                     self.last_cleanup_error = {

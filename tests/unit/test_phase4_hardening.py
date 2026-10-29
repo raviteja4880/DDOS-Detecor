@@ -2,6 +2,7 @@ import io
 import json
 import sys
 import pathlib
+import subprocess
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
@@ -100,7 +101,7 @@ def test_live_linux_nftables_flow(monkeypatch):
             self.stdout = stdout
             self.stderr = stderr
 
-    def fake_run(cmd, shell=False, capture_output=False, text=None, check=False):
+    def fake_run(cmd, shell=False, capture_output=False, text=None, check=False, timeout=None):
         calls.append(cmd)
         if cmd[:3] == ["nft", "-j", "list"]:
             add_calls = [call for call in calls if call[1:3] == ["add", "rule"]]
@@ -142,7 +143,7 @@ def test_nft_rule_handles_parse_rule_objects_and_ignore_chain_handle(monkeypatch
         ]
     }
 
-    def fake_run(cmd, shell=False, capture_output=False, text=None, check=False):
+    def fake_run(cmd, shell=False, capture_output=False, text=None, check=False, timeout=None):
         return Completed(stdout=json.dumps(payload))
 
     monkeypatch.setattr("ddos_detector.mitigation.subprocess.run", fake_run)
@@ -169,7 +170,7 @@ def test_cleanup_all_discovers_application_rules_from_kernel_state(monkeypatch):
         ]
     }
 
-    def fake_run(cmd, shell=False, capture_output=False, text=None, check=False):
+    def fake_run(cmd, shell=False, capture_output=False, text=None, check=False, timeout=None):
         calls.append(cmd)
         if cmd[:3] == ["nft", "-j", "list"]:
             return Completed(stdout=json.dumps(payload))
@@ -199,7 +200,7 @@ def test_cleanup_removes_only_tracked_nftables_rule(monkeypatch):
             self.stdout = stdout
             self.stderr = stderr
 
-    def fake_run(cmd, shell=False, capture_output=False, text=None, check=False):
+    def fake_run(cmd, shell=False, capture_output=False, text=None, check=False, timeout=None):
         calls.append(cmd)
         if cmd[:3] == ["nft", "-j", "list"]:
             payload = {"nftables": [{"chain": {"table": "ddos_detector", "name": "input", "rules": [{"handle": 12, "comment": "ddos_detector:live-1"}]}}]}
@@ -264,6 +265,39 @@ def test_cleanup_already_deleted_rule_is_idempotent(monkeypatch):
     manager = MitigationManager({"enabled": True, "dry_run": False, "mechanism": "nftables"})
     assert manager.cleanup_all() == []
     assert manager.last_cleanup_error is None
+
+
+def test_nft_command_uses_timeout_and_reports_hang(monkeypatch):
+    from ddos_detector.mitigation import NFT_COMMAND_TIMEOUT_SECONDS
+
+    calls = []
+
+    def timeout_run(command, **kwargs):
+        calls.append(kwargs)
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr("ddos_detector.mitigation.subprocess.run", timeout_run)
+    manager = MitigationManager({"enabled": True, "dry_run": False, "mechanism": "nftables"})
+
+    with pytest.raises(RuntimeError, match="nft command timed out"):
+        manager._run_nft_command(["-j", "list", "chain", "inet", "ddos_detector", "input"])
+
+    assert calls[0]["timeout"] == NFT_COMMAND_TIMEOUT_SECONDS
+
+
+def test_monitor_lock_failure_exits_safely(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("DDOS_DETECTOR_LOCK_DIR", str(tmp_path))
+    monkeypatch.setattr("ddos_detector.main.platform.system", lambda: "Linux", raising=False)
+    monkeypatch.setattr("ddos_detector.main.os.path.isdir", lambda path: True)
+    monkeypatch.setattr(
+        "ddos_detector.main._monitor_instance_lock",
+        lambda interface: (_ for _ in ()).throw(RuntimeError("another monitor owns interface eth0")),
+    )
+
+    result = _run_monitor(type("Args", (), {"interface": "eth0"})(), Config(interface="eth0"))
+
+    assert result == 1
+    assert "another monitor owns interface eth0" in capsys.readouterr().err
 
 
 def test_monitor_rejects_windows_live_capture(monkeypatch, capsys):

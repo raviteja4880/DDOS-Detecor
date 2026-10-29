@@ -504,3 +504,43 @@ def test_varying_ephemeral_ports_send_only_one_email_until_recovery(monkeypatch)
 
     # Exactly ONE new alert is sent for the new incident
     assert posted["count"] == 2
+
+
+def test_missing_brevo_configuration_is_safe_and_retryable(monkeypatch, caplog):
+    for name in (
+        "BREVO_API_KEY",
+        "BREVO_SENDER_EMAIL",
+        "BREVO_SENDER_NAME",
+        "BREVO_ALERT_RECIPIENT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    calls = []
+
+    def fake_post(url, json=None, headers=None, timeout=10):
+        calls.append(url)
+
+        class Response:
+            status_code = 201
+            text = "created"
+
+        return Response()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    config = {"email": {"enabled": True, "provider": "brevo"}}
+    context = {"interface": "eth-test", "target_ips": ["192.0.2.10"]}
+
+    maybe_emit_alert("HIGH_RISK", 0.9, ["synthetic test"], context=context, alert_cfg=config)
+
+    assert calls == []
+    assert "reason=missing_configuration" in caplog.text
+    assert "BREVO_API_KEY" in caplog.text
+    assert "EMAIL_ATTEMPTED=false" in caplog.text
+
+    monkeypatch.setenv("BREVO_API_KEY", "test-only-placeholder")
+    monkeypatch.setenv("BREVO_SENDER_EMAIL", "sender@example.test")
+    monkeypatch.setenv("BREVO_ALERT_RECIPIENT", "recipient@example.test")
+    maybe_emit_alert("HIGH_RISK", 0.9, ["synthetic test"], context=context, alert_cfg=config)
+
+    assert len(calls) == 1
+    assert "test-only-placeholder" not in caplog.text

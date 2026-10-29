@@ -481,8 +481,37 @@ Offender history is bounded and in-memory only; it expires after
 `history_ttl_seconds` and resets on process restart. Active nftables rules
 remain detector-owned and discoverable after restart, so cleanup can remove
 them safely. Brevo alert cooldown/deduplication remains independent of
-mitigation history and prevents repeated identical alert emails within its
-configured cooldown.
+mitigation history. Alert incident state is process-local: separate detector
+processes and process restarts do not share notification deduplication state,
+so a restarted or concurrently launched process can send a duplicate incident
+notification. Persistent cross-process incident state is not implemented.
+
+### Phase 2 validation evidence
+
+`scripts/measure_monitor.py` is a bounded, synthetic-only benchmark. Run it
+from Linux/WSL2 with:
+
+```bash
+.venv-linux/bin/python scripts/measure_monitor.py
+```
+
+It injects a 5 packets/s normal phase, a 50 packets/s two-second synthetic
+burst, and another 5 packets/s normal phase into the monitor's bounded queue.
+It opens no packet-capture socket, transmits no packets, and uses dry-run
+mitigation. One recorded WSL2 run (Linux
+`6.6.87.2-microsoft-standard-WSL2`, Python 3.12.3) lasted 21.804 seconds and
+reported 0.088 seconds process CPU (0.40% of one core), RSS from 70,992 to
+71,120 KiB, 202/202 injected records processed, no synthetic queue drops,
+1.201 seconds to HIGH_RISK, 2.2 seconds to the second NORMAL scoring window,
+and 11.01 scheduled cleanup calls/minute (excluding startup/shutdown).
+This is a single low-rate Python processing-loop measurement, not a Scapy/NIC
+capture benchmark or a throughput claim. Re-run the script to collect results
+for the local environment.
+
+No live nftables integration test was run as part of this validation; kernel
+enforcement remains **NOT VERIFIED**. Synthetic pipeline tests do not provide
+labelled research data, so precision, recall, F1, false-positive rate, and
+real-network detection performance remain unmeasured.
 
 ### Dry-run localhost demonstration
 
