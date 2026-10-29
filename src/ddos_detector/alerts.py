@@ -60,6 +60,8 @@ from typing import Callable
 
 # In-memory incident-scoped cooldown store: stable incident key -> last accepted epoch.
 ALERT_LAST_SENT: Dict[str, float] = {}
+INCIDENT_STATE: Dict[str, Dict[str, Any]] = {}
+EMAIL_IN_FLIGHT: set[str] = set()
 ALERT_COOLDOWN_LOCK = threading.RLock()
 
 
@@ -233,6 +235,9 @@ def _send_email_via_smtp(alert: Dict[str, Any], smtp_config: Dict[str, Any]) -> 
         else:
             smtp = smtplib.SMTP(host, port, timeout=10)
         smtp.ehlo()
+        if port != 465:
+            smtp.starttls()
+            smtp.ehlo()
         if user and password:
             smtp.login(user, password)
         smtp.send_message(msg)
@@ -249,8 +254,23 @@ def _incident_key(context: Dict[str, Any] | None) -> str:
     context = context or {}
     interface = str(context.get("interface") or "unknown")
     targets = tuple(sorted(str(item) for item in (context.get("target_ips") or [])))
-    ports = tuple(sorted(str(item) for item in (context.get("target_ports") or [])))
-    return json.dumps({"interface": interface, "target_ips": targets, "target_ports": ports}, sort_keys=True)
+    return json.dumps({"interface": interface, "target_ips": targets}, sort_keys=True)
+
+
+def mark_normal_window(interface: str, required_windows: int = 2) -> None:
+    """Re-arm incidents after consecutive normal windows on an interface."""
+    required = max(1, int(required_windows))
+    with ALERT_COOLDOWN_LOCK:
+        for key, state in list(INCIDENT_STATE.items()):
+            if state.get("interface") != str(interface):
+                continue
+            state["normal_windows"] = int(state.get("normal_windows", 0)) + 1
+            if state["normal_windows"] < required:
+                continue
+            INCIDENT_STATE.pop(key, None)
+            ALERT_LAST_SENT.pop(key, None)
+            logger.info("INCIDENT_RECOVERED incident=%s", key)
+            logger.info("INCIDENT_REARMED incident=%s", key)
 
 
 def _send_email_via_brevo(alert: Dict[str, Any], brevo_config: Dict[str, Any]) -> Dict[str, Any]:
@@ -357,7 +377,9 @@ def maybe_emit_alert(
         email_conf = alert_cfg.get("email", {}) or {}
         email_enabled = bool(email_conf.get("enabled", False))
         email_provider = email_conf.get("provider")
-        cooldown_seconds = int(alert_cfg.get("cooldown_seconds", cooldown_seconds))
+        cooldown_seconds = int(
+            email_conf.get("cooldown_seconds", alert_cfg.get("cooldown_seconds", cooldown_seconds))
+        )
         if os.environ.get("ALERT_SMTP_ENABLED") == "1":
             email_enabled = True
             email_provider = email_provider or "smtp"
@@ -380,6 +402,9 @@ def maybe_emit_alert(
         elif os.environ.get("SMTP_HOST"):
             email_provider = "smtp"
 
+    context = context or {}
+    interface = str(context.get("interface") or "unknown")
+    targets = tuple(sorted(str(item) for item in (context.get("target_ips") or [])))
     incident_key = _incident_key(context)
     now = (clock or time.time)()
 
@@ -387,28 +412,66 @@ def maybe_emit_alert(
     email_cooldown_allowed = False
     email_attempted = False
     email_result: Dict[str, Any] = {"delivered": False, "status": "not_enabled", "reason": "email_disabled"}
+    should_send = False
     with ALERT_COOLDOWN_LOCK:
-        last_sent = ALERT_LAST_SENT.get(incident_key)
+        state = INCIDENT_STATE.get(incident_key)
+        # Check if an ongoing incident on this interface is already active/notified
+        if state is None:
+            for existing_key, existing_state in INCIDENT_STATE.items():
+                if existing_state.get("interface") == interface:
+                    existing_targets = existing_state.get("targets", set())
+                    # If current window has no specific targets, or existing has no targets,
+                    # or targets overlap, link to the existing active incident
+                    if not targets or not existing_targets or (set(targets) & existing_targets):
+                        incident_key = existing_key
+                        state = existing_state
+                        break
+
+        if state is None:
+            state = {
+                "interface": interface,
+                "notified": False,
+                "normal_windows": 0,
+                "targets": set(targets),
+            }
+            INCIDENT_STATE[incident_key] = state
+            logger.info("INCIDENT_STARTED incident=%s", incident_key)
+        state["normal_windows"] = 0
         if email_enabled:
-            if last_sent is not None and now - last_sent < cooldown_seconds:
-                logger.info("Skipping email send due to cooldown (%s seconds) for incident=%s", cooldown_seconds, incident_key)
-                email_result = {"delivered": False, "status": "cooldown", "reason": "cooldown"}
+            if state.get("notified"):
+                email_result = {"delivered": False, "status": "incident_active", "reason": "duplicate_incident"}
+                logger.info("EMAIL_SUPPRESSED_DUPLICATE incident=%s", incident_key)
+            elif incident_key in EMAIL_IN_FLIGHT:
+                email_result = {"delivered": False, "status": "in_flight", "reason": "duplicate_in_flight"}
+                logger.info("EMAIL_SUPPRESSED_IN_FLIGHT incident=%s", incident_key)
             else:
-                email_cooldown_allowed = True
-                if email_provider == "brevo":
-                    email_result = _send_email_via_brevo(alert, email_conf)
-                    email_configuration_valid = bool(email_result.get("configuration_valid", False))
-                    email_attempted = bool(email_result.get("attempted", False))
-                elif email_provider == "smtp":
-                    email_result = _send_email_via_smtp(alert, email_conf)
-                    email_attempted = bool(email_result.get("attempted", False))
+                last_sent = ALERT_LAST_SENT.get(incident_key)
+                if last_sent is not None and now - last_sent < cooldown_seconds:
+                    email_result = {"delivered": False, "status": "cooldown", "reason": "cooldown"}
                 else:
-                    logger.warning("No email provider configured; skipping email send")
-                    email_configuration_valid = False
-                    email_result = {"delivered": False, "status": "not_configured", "reason": "provider_missing"}
-                # Delivery failures are retryable and do not consume the cooldown.
-                if email_result.get("delivered"):
-                    ALERT_LAST_SENT[incident_key] = now
+                    email_cooldown_allowed = True
+                    EMAIL_IN_FLIGHT.add(incident_key)
+                    should_send = True
+
+    if should_send:
+        if email_provider == "brevo":
+            email_result = _send_email_via_brevo(alert, email_conf)
+            email_configuration_valid = bool(email_result.get("configuration_valid", False))
+            email_attempted = bool(email_result.get("attempted", False))
+        elif email_provider == "smtp":
+            email_result = _send_email_via_smtp(alert, email_conf)
+            email_attempted = bool(email_result.get("attempted", False))
+        else:
+            logger.warning("No email provider configured; skipping email send")
+            email_configuration_valid = False
+            email_result = {"delivered": False, "status": "not_configured", "reason": "provider_missing"}
+        with ALERT_COOLDOWN_LOCK:
+            EMAIL_IN_FLIGHT.discard(incident_key)
+            if email_result.get("delivered"):
+                ALERT_LAST_SENT[incident_key] = now
+                if incident_key in INCIDENT_STATE:
+                    INCIDENT_STATE[incident_key]["notified"] = True
+                logger.info("EMAIL_DELIVERED incident=%s", incident_key)
     logger.info(
         "EMAIL_ENABLED=%s EMAIL_CONFIGURATION_VALID=%s EMAIL_COOLDOWN_ALLOWED=%s "
         "EMAIL_ATTEMPTED=%s BREVO_RESPONSE_STATUS=%s EMAIL_DELIVERED/ACCEPTED=%s",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import platform
 import re
@@ -11,6 +12,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from ipaddress import ip_address, ip_network
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -205,17 +208,6 @@ class MitigationManager:
                 "shared_or_nat": False,
                 "reason": "Source IP is trusted or excluded from automatic mitigation.",
             }
-        for entry in self.config.shared_source_networks or []:
-            try:
-                network = ip_network(entry, strict=False)
-                if candidate.version == network.version and candidate in network:
-                    return {
-                        "attributable": False,
-                        "shared_or_nat": True,
-                        "reason": "Source IP is in a configured shared/NAT network.",
-                    }
-            except ValueError:
-                continue
         for entry in self.config.attributable_sources or []:
             try:
                 network = ip_network(entry, strict=False)
@@ -224,6 +216,17 @@ class MitigationManager:
                         "attributable": True,
                         "shared_or_nat": False,
                         "reason": "Source IP is explicitly configured as attributable.",
+                    }
+            except ValueError:
+                continue
+        for entry in self.config.shared_source_networks or []:
+            try:
+                network = ip_network(entry, strict=False)
+                if candidate.version == network.version and candidate in network:
+                    return {
+                        "attributable": False,
+                        "shared_or_nat": True,
+                        "reason": "Source IP is in a configured shared/NAT network.",
                     }
             except ValueError:
                 continue
@@ -322,14 +325,20 @@ class MitigationManager:
                 text=True,
                 check=False,
             )
-        except OSError:
-            return False
+        except OSError as exc:
+            raise RuntimeError(f"Unable to inspect detector-owned nftables rules: {exc}") from exc
         if result.returncode != 0:
-            return []
+            stderr = (result.stderr or "").lower()
+            if "no such file or directory" in stderr or "does not exist" in stderr:
+                return []
+            raise RuntimeError(
+                "Unable to inspect detector-owned nftables rules: "
+                f"{result.stderr.strip() or result.stdout.strip() or 'nft command failed'}"
+            )
         try:
             payload = json.loads(result.stdout or "{}")
-        except json.JSONDecodeError:
-            return []
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("nft returned invalid JSON while inspecting owned rules") from exc
         handles: List[str] = []
         for entry in payload.get("nftables", []):
             if not isinstance(entry, dict):
@@ -450,7 +459,7 @@ class MitigationManager:
         try:
             self._remove_nftables_rule(rule)
         except Exception:
-            pass
+            logger.exception("Failed to roll back partial nftables rule %s", rule.rule_id)
 
     def _discover_nft_application_rules(self) -> List[Dict[str, Any]]:
         if not self._is_linux() or not self._tool_available("nft"):
@@ -463,11 +472,17 @@ class MitigationManager:
             check=False,
         )
         if result.returncode != 0:
-            return []
+            stderr = (result.stderr or "").lower()
+            if "no such file or directory" in stderr or "does not exist" in stderr:
+                return []
+            raise RuntimeError(
+                "Unable to discover detector-owned nftables rules: "
+                f"{result.stderr.strip() or result.stdout.strip() or 'nft command failed'}"
+            )
         try:
             payload = json.loads(result.stdout or "{}")
-        except json.JSONDecodeError:
-            return []
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("nft returned invalid JSON while discovering owned rules") from exc
 
         discovered: List[Dict[str, Any]] = []
         seen: set[tuple[str, str]] = set()
@@ -763,6 +778,7 @@ class MitigationManager:
         return result
 
     def cleanup_expired(self, now: Optional[datetime] = None) -> List[str]:
+        self.last_cleanup_error = None
         if now is None:
             now = datetime.now(timezone.utc)
         removed: List[str] = []
@@ -772,7 +788,12 @@ class MitigationManager:
                 if rule.source_ip:
                     key = self._source_key(rule.source_ip, rule.target, rule.interface)
                     entry = self.offender_history.get(key)
-                if self.config.mechanism == "nftables" and self._is_linux() and self._tool_available("nft"):
+                if (
+                    not self.config.dry_run
+                    and self.config.mechanism == "nftables"
+                    and self._is_linux()
+                    and self._tool_available("nft")
+                ):
                     cleanup_result = self._remove_nftables_rule(rule)
                     if cleanup_result.get("success") is False:
                         self.last_cleanup_error = cleanup_result
@@ -786,7 +807,12 @@ class MitigationManager:
                 removed.append(rule.rule_id)
             else:
                 remaining.append(rule)
-        if self.config.mechanism == "nftables" and self._is_linux() and self._tool_available("nft"):
+        if (
+            not self.config.dry_run
+            and self.config.mechanism == "nftables"
+            and self._is_linux()
+            and self._tool_available("nft")
+        ):
             for rule_info in self._discover_nft_application_rules():
                 rule_id = rule_info["rule_id"]
                 if not self._rule_id_expired(rule_id, now):
@@ -817,7 +843,9 @@ class MitigationManager:
         return removed
 
     def cleanup_all(self) -> List[str]:
+        self.last_cleanup_error = None
         removed: List[str] = []
+        remaining: List[MitigationRule] = []
         self.last_cleanup_error = None
         discovered: List[Dict[str, Any]] = []
         if self.config.mechanism == "nftables" and self._is_linux() and self._tool_available("nft"):
@@ -852,7 +880,8 @@ class MitigationManager:
                 cleanup_result = self._remove_nftables_rule(rule)
                 if cleanup_result.get("success") is False:
                     self.last_cleanup_error = cleanup_result
+                    remaining.append(rule)
                     continue
             removed.append(rule.rule_id)
-        self.rules = []
+        self.rules = remaining
         return removed

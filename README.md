@@ -76,9 +76,10 @@ The system detects "DDoS-like distributed traffic anomalies" rather than claimin
 
 ## 7. Technology Stack
 - Python 3.10+
+- Scapy for Linux packet capture and parsing
 - PyYAML for configuration parsing
+- Requests for Brevo alert delivery
 - pytest for unit/integration tests
-- standard library only for the defensive safety layer
 - no frontend, no database, no cloud service, no machine learning model
 
 ## 8. Detection Methodology
@@ -100,14 +101,33 @@ learned statistical baseline; it is not proof that an IP or user is malicious.
 HIGH_RISK requires a sufficiently high reproducible score, at least three
 triggered indicators, and corroboration from a SYN, connection, or
 distributed-source signal. Live monitoring also requires the configured number
-of consecutive HIGH_RISK windows (two in the example configuration) before
+of consecutive HIGH_RISK windows (one in the committed example configuration) before
 raising the high-risk classification. This reduces one-window spikes and
 packet/byte-only false positives while preserving explainable indicators.
 
-The baseline warms up before classification. Suspicious windows are excluded
-from baseline updates, and extreme outliers are rejected from otherwise clean
-baseline updates so a sudden spike does not immediately redefine normal
-traffic. Legitimate deployment bursts, downloads, health checks, or many
+Live monitoring begins in an explicit `BASELINE_WARMUP` state; it does not
+classify traffic as `NORMAL` or use the first packet-bearing window as a
+baseline. Bootstrap requires three valid observation windows.
+Their metrics are compared with the per-feature median using a deterministic
+outlier bound: the larger of six median absolute deviations or 25% of the
+median's magnitude (with a minimum tolerance of 0.25). At least two of the
+three observations must agree to seed the baseline; rejected observations
+cannot contribute to it. Later bootstrap windows must remain within the same
+robust bounds of the accepted samples, and the detector stays in warm-up until
+`baseline.minimum_samples` trustworthy windows have been collected. Empty,
+all-zero windows are valid observations; malformed, negative, non-finite, or
+structurally inconsistent metrics are rejected. After warm-up, only windows
+classified `NORMAL` are offered to the baseline, and extreme outliers are
+rejected by the baseline engine.
+
+This screening reduces the influence of isolated startup spikes, but no
+statistical method can distinguish a sustained attack from legitimate traffic
+when no trusted reference exists. During cold start, a sustained and internally
+consistent burst may still resemble normal traffic; monitoring does not claim
+to detect every attack before a trusted baseline is available. Each
+metric is calculated over `[boundary - window_seconds, boundary)` and emitted
+every `slide_seconds` using monotonic arrival times. Sliding metrics overlap
+intentionally and must not be summed. Legitimate deployment bursts, downloads, health checks, or many
 simultaneous clients can still look anomalous; operators should interpret
 alerts as behavior requiring attention, not as a definitive attack verdict.
 
@@ -125,7 +145,8 @@ Rejected targets:
 - arbitrary external IPs
 - URLs or untrusted hostnames
 
-The simulation limits are bounded to prevent accidental high-rate traffic generation.
+Simulation creates synthetic metric records only. It opens no sockets and sends
+no network traffic; its limits bound the synthetic values and source counts.
 
 ## 11. Alerting
 Alerting is structured and lightweight. Alerts include:
@@ -151,11 +172,11 @@ Safe behavior:
 - host modification is never the default
 
 ## 13. Recovery
-The recovery layer tracks alert and mitigation states in memory with bounded capacity. It supports:
-- alert creation
-- rule cleanup
-- expired rule removal
-- repeated cleanup without crashing
+Runtime alert incidents are re-armed after the configured number of
+consecutive `NORMAL` windows. Mitigation records track rule ownership and
+expiration, and cleanup targets only detector-owned rules. `RecoveryTracker`
+in `recovery.py` remains a standalone compatibility utility and is not wired
+into the live incident lifecycle.
 
 ## 14. Safety Restrictions
 This project is intentionally constrained to remain safe and academic.
@@ -167,18 +188,30 @@ The system does not:
 - claim definitive proof of an attack without a broader context
 
 ## 15. Installation
-From the project root:
+Windows supports development, tests, synthetic simulation, and dry-run flows.
+Live packet capture is Linux/WSL2-only, and live nftables enforcement is
+Linux-only.
+
+Windows PowerShell:
 
 ```bash
 python -m venv .venv
-# Windows PowerShell
 .\.venv\Scripts\Activate.ps1
-
-pip install -r requirements.txt
-pip install -e .
+python -m pip install -e ".[test]"
 ```
 
-The editable install makes `python -m ddos_detector --help` available in the active environment.
+Linux/WSL2 (Python 3.12 is the tested live-capture environment):
+
+```bash
+python3 -m venv .venv-linux
+source .venv-linux/bin/activate
+python -m pip install -e ".[test]"
+```
+
+`python -m pip install -r requirements.txt` is also available for environments
+that prefer the flat dependency list. The editable install enables
+`python -m ddos_detector --help`. Native Windows does not support live Linux
+packet capture or nftables enforcement.
 
 ## 16. Configuration
 The project configuration lives in `config/config.yaml`.
@@ -206,10 +239,13 @@ python -m ddos_detector mitigate --target 127.0.0.1 --interface lo
 python -m ddos_detector cleanup --all
 ```
 
-Command behavior is intentionally clear:
-- demo = synthetic local example
-- dry-run = no system modification
-- live/lab = only if the user explicitly enables it and uses a safe local target
+`simulate` prints synthetic metrics; it does not transmit traffic. `alert` can
+send email when Brevo delivery is enabled and correctly configured, so disable
+`alerts.email.enabled` when demonstrating alert formatting without delivery.
+Mitigation is disabled in the committed configuration; dry-run creates only an
+in-memory record when explicitly enabled. Live enforcement requires an explicit
+`mitigation.enabled: true` and `mitigation.dry_run: false` configuration and is
+supported only inside an isolated Linux namespace/veth lab.
 
 ## 18. Testing
 Run the test suite with:
@@ -230,47 +266,46 @@ The project includes unit tests for:
 - end-to-end deterministic flow
 
 ## 19. Windows Limitations
-Windows is used for local development and unit testing.
+Windows is supported for development and unit testing when dependencies install.
 
 Supported:
 - coding and project validation
 - algorithmic testing
-- local simulation
-- dry-run flows
+- synthetic simulation (no network traffic)
+- dry-run mitigation flows
 
-Not supported by default:
-- real Linux firewall and traffic-control integration
-- live `nftables` or `tc` execution
-- privileged packet capture on native Linux interfaces
+Not supported:
+- live packet capture
+- Linux `nftables` or `tc` enforcement
 
 ## 20. Linux/WSL2 Requirements
-Linux or WSL2 is required for the following:
-- actual packet capture on a live interface
-- `nftables`-based mitigation experiments
-- `tc` traffic-control testing
-- any real network-level enforcement work
+Linux/WSL2 is required for live packet capture. Live `nftables` enforcement is
+Linux-only (including WSL2 installations that provide the required namespace
+and firewall capabilities); Windows does not provide either Linux feature.
+Live enforcement demonstrations must use an isolated Linux network namespace
+connected by a veth pair, not the host network, loopback, or a shared/NAT
+address. Packet parsing and live capture currently support IPv4 only; IPv6
+traffic is not monitored or enforced.
 
-These operations remain explicitly disabled unless configured by the user in a lab environment and verified on Linux/WSL2.
+Detection produces classifications and metrics. Alerting writes console and
+structured alerts, with optional Brevo delivery when explicitly configured.
+Kernel enforcement is a separate, opt-in action and requires both
+`mitigation.enabled: true` and `mitigation.dry_run: false`.
 
 ## 21. Example Demo Workflow
-A safe demonstration for a college project can look like this:
+A safe, non-networked demonstration uses synthetic metrics:
 
 ```bash
 python -m ddos_detector detect --demo
 python -m ddos_detector simulate --mode normal --target 127.0.0.1
 python -m ddos_detector simulate --mode distributed --target 10.0.0.5
-python -m ddos_detector alert --classification SUSPICIOUS --score 0.72 --reason distributed-pattern
-python -m ddos_detector mitigate --target 127.0.0.1 --interface lo
-python -m ddos_detector cleanup --all
 ```
 
-This demonstrates:
-1. normal traffic
-2. suspicious traffic
-3. distributed high-risk traffic
-4. alert generation
-5. dry-run mitigation
-6. cleanup and recovery
+These commands do not generate or capture network traffic and do not send
+email. Use the dry-run example below to exercise mitigation without changing
+the host. `alert` can deliver a real Brevo email if email delivery is enabled;
+do not use that command for a no-email demonstration unless email is disabled
+in the selected configuration.
 
 ## 22. Project Structure
 ```text
@@ -280,7 +315,6 @@ DDOS/
 ├── src/
 │   └── ddos_detector/
 │       ├── __init__.py
-│       ├── __main__.py
 │       ├── aggregator.py
 │       ├── alerts.py
 │       ├── baseline.py
@@ -301,9 +335,8 @@ DDOS/
 │   └── unit/
 ├── pyproject.toml
 ├── requirements.txt
-├── README.md
 ├── pytest.ini
-└── config.yaml
+└── README.md
 ```
 
 ## 23. Limitations
@@ -334,7 +367,7 @@ Before use, the project ensures:
 
 The design is intentionally defensive and suitable for use as a student project, demonstration, or technical lab exercise.
 
-## 26. WSL2 Localhost Demonstration
+## 26. Safe demonstrations and isolated live lab
 
 This walkthrough is for a controlled localhost/private-lab demonstration only. It must not be used against public or third-party systems.
 
@@ -356,12 +389,12 @@ Replace the path below with the actual project location:
 cd /path/to/DDOS
 ```
 
-### Step 3: Verify the environment
+### Verify the Linux environment
 
 ```bash
 python --version
 nft --version
-tcpdump --version
+ip -Version
 ```
 
 Use the Linux project interpreter for project execution:
@@ -370,13 +403,12 @@ Use the Linux project interpreter for project execution:
 .venv-linux/bin/python --version
 ```
 
-### Step 4: Install dependencies
+### Install dependencies
 
-This repository declares runtime and test dependencies in `requirements.txt` and is packaged through `pyproject.toml`. From the project root, use:
+From the project root, install runtime and test dependencies with:
 
 ```bash
-.venv-linux/bin/python -m pip install -r requirements.txt
-.venv-linux/bin/python -m pip install -e .
+.venv-linux/bin/python -m pip install -e ".[test]"
 ```
 
 ### Step 5: Configure Brevo
@@ -413,11 +445,11 @@ The monitor also loads a project-local `.env` next to the repository when it
 starts. Existing process variables take precedence, and only the four Brevo
 variable names above are read; arbitrary system files are not searched. This
 allows the application to find the project credentials when started as root.
-The explicit `sudo -E` command below remains useful for preserving exported
-variables, but it is not the only supported path. If email is enabled and any
-required variable is missing, startup stops with a configuration error naming
-the missing variable (never its value). If email is disabled, Brevo variables
-are not required.
+`sudo -E` preserves exported variables, but the application also loads only
+these supported names from the project-local `.env`. Missing Brevo values are
+reported as a configuration warning; email delivery is optional and disabled
+in the programmatic defaults. Do not run email-enabled demonstrations unless
+you intend to deliver a real email.
 
 ### Temporary mitigation lifecycle
 
@@ -452,104 +484,90 @@ them safely. Brevo alert cooldown/deduplication remains independent of
 mitigation history and prevents repeated identical alert emails within its
 configured cooldown.
 
-### Step 6: Clean detector-owned nftables rules
+### Dry-run localhost demonstration
 
-Before a fresh demonstration, remove only mitigation rules owned by this project:
-
-```bash
-sudo .venv-linux/bin/python -m ddos_detector cleanup --all
-```
-
-Never use a broad nftables ruleset flush command; it can remove unrelated
-firewall rules. Use the detector cleanup command above, which removes only
-detector-owned rules.
-
-### Step 7: Start the local test server
-
-In a separate WSL terminal, bind the server only to loopback:
+The simulator produces synthetic metrics; it does not transmit packets.
+Exercise the localhost mitigation path without changing host firewall state
+using an explicit temporary dry-run configuration:
 
 ```bash
-.venv-linux/bin/python -m http.server 18080 --bind 127.0.0.1
+cat > /tmp/ddos-detector-dry-run.yaml <<'YAML'
+mitigation:
+  enabled: true
+  dry_run: true
+  mechanism: nftables
+YAML
+
+.venv-linux/bin/python -m ddos_detector simulate --mode normal --target 127.0.0.1
+.venv-linux/bin/python -m ddos_detector mitigate \
+  --config /tmp/ddos-detector-dry-run.yaml \
+  --target 127.0.0.1 --interface lo
+rm /tmp/ddos-detector-dry-run.yaml
 ```
 
-This creates a local-only HTTP target.
+The mitigation action only creates an in-memory dry-run record. Do not use
+localhost or loopback for a live enforcement test.
 
-### Step 8: Start the DDoS detector
+### Live enforcement: isolated namespace/veth lab only
 
-In another WSL terminal, from the project directory:
+Live enforcement is Linux-only and requires root/CAP_NET_ADMIN privileges,
+`iproute2`, and `nftables`. Keep the lab isolated: create two namespaces with
+no routes, bridges, forwarding, or connection to external networks.
 
 ```bash
-sudo -E .venv-linux/bin/python -m ddos_detector monitor \
-  --config config/config.yaml \
-  --interface lo
+sudo ip netns add ddos-sensor
+sudo ip netns add ddos-target
+sudo ip link add ddos-veth0 type veth peer name ddos-veth1
+sudo ip link set ddos-veth0 netns ddos-sensor
+sudo ip link set ddos-veth1 netns ddos-target
+sudo ip -n ddos-sensor addr add 10.254.0.1/30 dev ddos-veth0
+sudo ip -n ddos-target addr add 10.254.0.2/30 dev ddos-veth1
+sudo ip -n ddos-sensor link set lo up
+sudo ip -n ddos-target link set lo up
+sudo ip -n ddos-sensor link set ddos-veth0 up
+sudo ip -n ddos-target link set ddos-veth1 up
 ```
 
-The monitor may report:
-
-- `BASELINE_WARMUP`
-- `NORMAL`
-- `SUSPICIOUS`
-- `HIGH_RISK`
-- triggered anomaly indicators and score
-- alert and mitigation status
-
-### Step 9: Generate controlled localhost demonstration traffic
-
-Run only this bounded loop against the local server:
+Create a separate, temporary live config only for this lab. Live enforcement
+requires both explicit settings. Automatic source blocking remains off unless
+separately enabled with explicit attribution:
 
 ```bash
-for i in $(seq 1 100); do
-    curl -s --max-time 2 http://127.0.0.1:18080/ > /dev/null &
-done
-wait
+cat > /tmp/ddos-detector-live-lab.yaml <<'YAML'
+mitigation:
+  enabled: true
+  dry_run: false
+  mechanism: nftables
+  rule_ttl_seconds: 30
+YAML
 ```
 
-This is **controlled localhost demonstration traffic**. Do not substitute a public address, external hostname, or third-party target.
-
-### Step 10: Inspect detector-owned nftables rules
+The following direct action installs a detector-owned rule inside the sensor
+namespace for its own veth address. It may disrupt traffic to that address:
 
 ```bash
-sudo nft -a list table inet ddos_detector
+sudo ip netns exec ddos-sensor .venv-linux/bin/python -m ddos_detector mitigate \
+  --config /tmp/ddos-detector-live-lab.yaml \
+  --target 10.254.0.1 --interface ddos-veth0
+sudo ip netns exec ddos-sensor nft -a list table inet ddos_detector
 ```
 
-During a configured `HIGH_RISK` response, a temporary detector-owned rule may look like:
-
-```text
-ip saddr 127.0.0.1 ip daddr 127.0.0.1 iifname "lo" drop comment "ddos_detector:source-live-..."
-```
-
-The rule ID and handle are generated at runtime; do not assume a particular value.
-
-### Step 11: Verify recovery
-
-After the bounded traffic stops, allow subsequent windows to process. The monitor should return toward:
-
-```text
-classification: NORMAL
-```
-
-This demonstrates recovery after the abnormal localhost window.
-
-### Step 12: Stop the monitor
-
-Return to the monitor terminal and press:
-
-```text
-Ctrl+C
-```
-
-Stop the temporary HTTP server with `Ctrl+C` in its terminal as well.
-
-### Step 13: Clean detector-owned nftables rules
+Clean detector-owned rules before deleting the namespaces. Confirm any cleanup
+error rather than assuming a rule was removed:
 
 ```bash
-sudo .venv-linux/bin/python -m ddos_detector cleanup --all
-sudo nft -a list table inet ddos_detector
+sudo ip netns exec ddos-sensor .venv-linux/bin/python -m ddos_detector cleanup --all
+sudo ip netns del ddos-sensor
+sudo ip netns del ddos-target
+rm /tmp/ddos-detector-live-lab.yaml
 ```
 
-Cleanup removes detector-owned mitigation rules only. It does not flush unrelated nftables rules.
+Never flush an nftables ruleset or remove rules not owned by this application.
+Detection, optional alert delivery, and kernel enforcement are separate:
+a classification does not itself imply an email or a DROP rule. Live capture
+and packet parsing currently support IPv4 only; IPv6 is unsupported.
 
-### Step 14: Run the test suite
+Run tests with:
 
 ```bash
 .venv-linux/bin/python -m pytest -q

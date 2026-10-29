@@ -7,6 +7,17 @@ from scapy.all import ICMP, IP, TCP, UDP
 from .models import PacketRecord
 
 
+def _normalize_tcp_flags(flags: Any) -> str | None:
+    if flags is None:
+        return None
+    if isinstance(flags, int):
+        names = ((0x01, "F"), (0x02, "S"), (0x04, "R"), (0x08, "P"),
+                 (0x10, "A"), (0x20, "U"), (0x40, "E"), (0x80, "C"),
+                 (0x100, "N"))
+        return "".join(name for bit, name in names if flags & bit)
+    return str(flags)
+
+
 def parse_packet(packet: Any) -> PacketRecord:
     """Parse a Scapy packet or a packet-like dict into a PacketRecord.
 
@@ -33,9 +44,7 @@ def parse_packet(packet: Any) -> PacketRecord:
         src_port = packet.get("src_port", packet.get("sport"))
         dst_port = packet.get("dst_port", packet.get("dport"))
         packet_size = int(packet.get("packet_size", packet.get("len", 0)))
-        tcp_flags = packet.get("tcp_flags", packet.get("flags"))
-        if tcp_flags is not None:
-            tcp_flags = str(tcp_flags)
+        tcp_flags = _normalize_tcp_flags(packet.get("tcp_flags", packet.get("flags")))
         return PacketRecord(
             timestamp=float(packet.get("timestamp", 0.0)),
             src_ip=src_ip,
@@ -65,7 +74,7 @@ def parse_packet(packet: Any) -> PacketRecord:
             protocol = "TCP"
             src_port = int(tcp.sport)
             dst_port = int(tcp.dport)
-            tcp_flags = str(tcp.flags)
+            tcp_flags = _normalize_tcp_flags(int(tcp.flags))
         elif packet.haslayer(UDP):
             udp = packet[UDP]
             protocol = "UDP"

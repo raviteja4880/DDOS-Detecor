@@ -54,7 +54,7 @@ def test_cli_help_and_invalid_command_behavior(capsys):
 
 def test_public_target_rejected_in_live_mitigation(monkeypatch):
     manager = MitigationManager({"enabled": True, "dry_run": False, "mechanism": "nftables"})
-    monkeypatch.setattr("ddos_detector.mitigation.os.name", "posix", raising=False)
+    monkeypatch.setattr("ddos_detector.mitigation.MitigationManager._is_linux", lambda self: True)
     monkeypatch.setattr("ddos_detector.mitigation.platform.system", lambda: "Linux", raising=False)
     monkeypatch.setattr("ddos_detector.mitigation.MitigationManager._tool_available", lambda self, tool: tool == "nft")
     monkeypatch.setattr("ddos_detector.mitigation.MitigationManager._interface_exists", lambda self, interface: interface == "lo", raising=False)
@@ -66,7 +66,7 @@ def test_public_target_rejected_in_live_mitigation(monkeypatch):
 
 def test_invalid_target_and_interface_rejected(monkeypatch):
     manager = MitigationManager({"enabled": True, "dry_run": False, "mechanism": "nftables"})
-    monkeypatch.setattr("ddos_detector.mitigation.os.name", "posix", raising=False)
+    monkeypatch.setattr("ddos_detector.mitigation.MitigationManager._is_linux", lambda self: True)
     monkeypatch.setattr("ddos_detector.mitigation.platform.system", lambda: "Linux", raising=False)
     monkeypatch.setattr("ddos_detector.mitigation.MitigationManager._tool_available", lambda self, tool: tool == "nft")
     monkeypatch.setattr("ddos_detector.mitigation.MitigationManager._interface_exists", lambda self, interface: False, raising=False)
@@ -111,9 +111,10 @@ def test_live_linux_nftables_flow(monkeypatch):
             return Completed(stdout=json.dumps(payload))
         return Completed()
 
-    monkeypatch.setattr("ddos_detector.mitigation.os.name", "posix", raising=False)
+    monkeypatch.setattr("ddos_detector.mitigation.MitigationManager._is_linux", lambda self: True)
     monkeypatch.setattr("ddos_detector.mitigation.platform.system", lambda: "Linux", raising=False)
     monkeypatch.setattr("ddos_detector.mitigation.os.geteuid", lambda: 0, raising=False)
+    monkeypatch.setattr("ddos_detector.mitigation.MitigationManager._has_root_privileges", lambda self: True)
     monkeypatch.setattr("ddos_detector.mitigation.MitigationManager._tool_available", lambda self, tool: tool == "nft")
     monkeypatch.setattr("ddos_detector.mitigation.MitigationManager._interface_exists", lambda self, interface: interface == "lo", raising=False)
     monkeypatch.setattr("ddos_detector.mitigation.subprocess.run", fake_run)
@@ -174,7 +175,7 @@ def test_cleanup_all_discovers_application_rules_from_kernel_state(monkeypatch):
             return Completed(stdout=json.dumps(payload))
         return Completed()
 
-    monkeypatch.setattr("ddos_detector.mitigation.os.name", "posix", raising=False)
+    monkeypatch.setattr("ddos_detector.mitigation.MitigationManager._is_linux", lambda self: True)
     monkeypatch.setattr("ddos_detector.mitigation.platform.system", lambda: "Linux", raising=False)
     monkeypatch.setattr("ddos_detector.mitigation.MitigationManager._tool_available", lambda self, tool: tool == "nft")
     monkeypatch.setattr("ddos_detector.mitigation.subprocess.run", fake_run)
@@ -205,7 +206,7 @@ def test_cleanup_removes_only_tracked_nftables_rule(monkeypatch):
             return Completed(stdout=json.dumps(payload))
         return Completed()
 
-    monkeypatch.setattr("ddos_detector.mitigation.os.name", "posix", raising=False)
+    monkeypatch.setattr("ddos_detector.mitigation.MitigationManager._is_linux", lambda self: True)
     monkeypatch.setattr("ddos_detector.mitigation.platform.system", lambda: "Linux", raising=False)
     monkeypatch.setattr("ddos_detector.mitigation.MitigationManager._tool_available", lambda self, tool: tool == "nft")
     monkeypatch.setattr("ddos_detector.mitigation.MitigationManager._interface_exists", lambda self, interface: interface == "lo", raising=False)
@@ -241,7 +242,7 @@ def test_cleanup_expired_recovers_expired_rule_after_restart(monkeypatch):
         calls.append(cmd)
         return Completed()
 
-    monkeypatch.setattr("ddos_detector.mitigation.os.name", "posix", raising=False)
+    monkeypatch.setattr("ddos_detector.mitigation.MitigationManager._is_linux", lambda self: True)
     monkeypatch.setattr("ddos_detector.mitigation.platform.system", lambda: "Linux", raising=False)
     monkeypatch.setattr("ddos_detector.mitigation.MitigationManager._tool_available", lambda self, tool: tool == "nft")
     monkeypatch.setattr("ddos_detector.mitigation.subprocess.run", fake_run)
@@ -256,7 +257,7 @@ def test_cleanup_already_deleted_rule_is_idempotent(monkeypatch):
         stdout = ""
         stderr = "No such file or directory"
 
-    monkeypatch.setattr("ddos_detector.mitigation.os.name", "posix", raising=False)
+    monkeypatch.setattr("ddos_detector.mitigation.MitigationManager._is_linux", lambda self: True)
     monkeypatch.setattr("ddos_detector.mitigation.platform.system", lambda: "Linux", raising=False)
     monkeypatch.setattr("ddos_detector.mitigation.MitigationManager._tool_available", lambda self, tool: True)
     monkeypatch.setattr("ddos_detector.mitigation.subprocess.run", lambda *args, **kwargs: Completed())
@@ -266,7 +267,6 @@ def test_cleanup_already_deleted_rule_is_idempotent(monkeypatch):
 
 
 def test_monitor_rejects_windows_live_capture(monkeypatch, capsys):
-    monkeypatch.setattr("ddos_detector.main.os.name", "nt", raising=False)
     monkeypatch.setattr("ddos_detector.main.platform.system", lambda: "Windows", raising=False)
     result = main(["monitor", "--interface", "eth0"])
     captured = capsys.readouterr()
@@ -275,7 +275,6 @@ def test_monitor_rejects_windows_live_capture(monkeypatch, capsys):
 
 
 def test_monitor_rejects_missing_interface(monkeypatch, capsys):
-    monkeypatch.setattr("ddos_detector.main.os.name", "posix", raising=False)
     monkeypatch.setattr("ddos_detector.main.platform.system", lambda: "Linux", raising=False)
     monkeypatch.setattr("ddos_detector.main.os.path.isdir", lambda path: False)
     result = main(["monitor", "--interface", "missing0"])
@@ -288,16 +287,21 @@ def test_packet_capture_reads_queued_packets():
     from ddos_detector.packet_capture import LinuxPacketCapture
 
     capture = LinuxPacketCapture("lo")
-    capture._queue.append("packet-1")
-    capture._queue.append("packet-2")
+    capture._on_packet("packet-1")
+    capture._on_packet("packet-2")
     assert capture.read_packets(10) == ["packet-1", "packet-2"]
     assert capture.read_packets(10) == []
 
 
-def test_monitor_uses_detected_normal_window(monkeypatch):
+def test_monitor_uses_detected_normal_window(monkeypatch, tmp_path):
+    monkeypatch.setenv("DDOS_DETECTOR_LOCK_DIR", str(tmp_path))
+    clock = [0.0]
+    monkeypatch.setattr("ddos_detector.main.time.monotonic", lambda: clock[0])
+
     class FakeCapture:
         def __init__(self):
             self.calls = 0
+            self.waits = 0
 
         def __enter__(self):
             return self
@@ -305,45 +309,25 @@ def test_monitor_uses_detected_normal_window(monkeypatch):
         def __exit__(self, exc_type, exc, tb):
             return False
 
+        def wait_for_packets(self, timeout):
+            self.waits += 1
+            clock[0] += 4.9 if self.waits == 1 else timeout
+
         def read_packets(self, count=100):
             self.calls += 1
             if self.calls == 1:
                 return [PacketRecord(timestamp=1.0, src_ip="10.0.0.1", dst_ip="10.0.0.2", src_port=1234, dst_port=80, protocol="TCP", packet_size=128, tcp_flags="S")]
-            raise KeyboardInterrupt
+            if self.calls == 2:
+                return []
+            raise KeyboardInterrupt()
 
-    monkeypatch.setattr("ddos_detector.main.os.name", "posix", raising=False)
     monkeypatch.setattr("ddos_detector.main.platform.system", lambda: "Linux", raising=False)
     monkeypatch.setattr("ddos_detector.main.os.path.isdir", lambda path: True)
     monkeypatch.setattr("ddos_detector.main.open_capture", lambda interface, bpf_filter="": FakeCapture())
-    monkeypatch.setattr("ddos_detector.main.parse_packet", lambda packet: packet)
-    monkeypatch.setattr(
-        "ddos_detector.main.compute_window_metrics",
-        lambda packets, seconds: WindowMetric(
-            window_seconds=seconds,
-            packets=len(packets),
-            bytes=128,
-            packets_per_sec=1.0,
-            bytes_per_sec=128.0,
-            tcp_packets=1,
-            udp_packets=0,
-            icmp_packets=0,
-            syn_packets=1,
-            connection_attempts=1,
-            unique_src_ips=1,
-            unique_dst_ips=1,
-            dst_port_distribution={80: 1},
-            avg_packet_size=128.0,
-            burst_intensity=1.0,
-            dest_concentration=1.0,
-            raw=packets,
-        ),
-    )
     monkeypatch.setattr("ddos_detector.main.BaselineEngine.is_ready", lambda self: True)
-    monkeypatch.setattr("ddos_detector.main.analyze_window", lambda current, baseline, minimum_indicators=2: type("D", (), {"indicators": [], "triggered_indicators": [], "reason": "No anomaly detected", "score": 0.0, "classification": "NORMAL"})())
+    monkeypatch.setattr("ddos_detector.main.analyze_window", lambda current, baseline, minimum_indicators=2, allow_provisional=False: type("D", (), {"indicators": [], "triggered_indicators": [], "reason": "No anomaly detected", "score": 0.0, "classification": "NORMAL"})())
     monkeypatch.setattr("ddos_detector.main.score_and_classify", lambda indicators, weights=None, thresholds=None: (0.05, "NORMAL"))
     monkeypatch.setattr("ddos_detector.main.maybe_emit_alert", lambda *args, **kwargs: None)
-    monkeypatch.setattr("ddos_detector.main.time.sleep", lambda _: None)
-
     cfg = Config(interface="lo")
     result = _run_monitor(type("Args", (), {"interface": "lo"})(), cfg)
     assert result == 0

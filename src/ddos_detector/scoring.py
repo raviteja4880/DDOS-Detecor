@@ -10,6 +10,8 @@ def clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
 
 
 def normalize_indicator(indicator: IndicatorResult) -> float:
+    if not indicator.triggered:
+        return 0.0
     if indicator.baseline <= 0:
         if indicator.current > 0:
             return 1.0
@@ -68,7 +70,9 @@ def score_and_classify(indicators: Iterable[IndicatorResult], weights: Dict[str,
     classification = classify_score(score, thresholds=thresholds)
     triggered = [item for item in indicator_list if item.triggered]
     strong_names = {"SYN-rate anomaly", "connection-rate anomaly", "distributed-source anomaly"}
-    if classification == "HIGH_RISK" and (
+    if not triggered:
+        classification = "NORMAL"
+    elif classification == "HIGH_RISK" and (
         len(triggered) < 3 or not any(item.name in strong_names for item in triggered)
     ):
         classification = "SUSPICIOUS"

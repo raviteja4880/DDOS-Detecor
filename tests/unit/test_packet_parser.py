@@ -8,6 +8,7 @@ import pytest
 from scapy.all import Ether, ICMP, IP, TCP, UDP
 
 from ddos_detector.feature_extractor import extract_features
+from ddos_detector.packet_capture import ScapyAsyncCapture
 from ddos_detector.packet_parser import parse_packet
 
 
@@ -63,3 +64,32 @@ def test_parse_packet_rejects_unsupported_packet():
 def test_parse_packet_rejects_malformed_packet():
     with pytest.raises(ValueError):
         parse_packet({"protocol": "TCP", "src_ip": "10.0.0.1"})
+
+
+def test_capture_queue_waits_for_packets_and_drains_bounded_batches():
+    capture = ScapyAsyncCapture("test0", queue_max=2)
+    assert capture.wait_for_packets(timeout=0) is False
+
+    capture._on_packet("first")
+    assert capture.wait_for_packets(timeout=0) is True
+    assert capture.read_packets(count=1) == ["first"]
+
+    capture._on_packet("second")
+    capture._on_packet("third")
+    capture._on_packet("fourth")
+    assert capture.read_packets(count=10) == ["third", "fourth"]
+
+
+def test_capture_records_monotonic_packet_times():
+    import time
+
+    capture = ScapyAsyncCapture("test0")
+    before = time.monotonic()
+    capture._on_packet("packet")
+    timed = capture.read_timed_packets()
+    after = time.monotonic()
+
+    assert len(timed) == 1
+    timestamp, packet = timed[0]
+    assert packet == "packet"
+    assert before <= timestamp <= after

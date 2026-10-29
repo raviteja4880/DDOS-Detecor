@@ -13,10 +13,15 @@ from __future__ import annotations
 
 import os
 import platform
+import logging
+import threading
+import time
 from collections import deque
 from typing import Any, Deque, List
 
 from scapy.all import AsyncSniffer
+
+logger = logging.getLogger(__name__)
 
 
 class ScapyAsyncCapture:
@@ -35,7 +40,8 @@ class ScapyAsyncCapture:
     def __init__(self, interface: str, bpf_filter: str = "", queue_max: int = 10000):
         self.interface = interface
         self.bpf_filter = bpf_filter or ""
-        self._queue: Deque[Any] = deque()
+        self._queue: Deque[tuple[float, Any]] = deque()
+        self._condition = threading.Condition()
         self._sniffer: AsyncSniffer | None = None
         self._stopped = False
         self._queue_max = max(1, int(queue_max))
@@ -44,13 +50,19 @@ class ScapyAsyncCapture:
         # Drop packets if queue grows too large to avoid memory blowups
         if packet is None:
             return
-        if len(self._queue) >= self._queue_max:
-            # drop oldest to make room
-            try:
+        with self._condition:
+            if len(self._queue) >= self._queue_max:
                 self._queue.popleft()
-            except IndexError:
-                pass
-        self._queue.append(packet)
+            self._queue.append((time.monotonic(), packet))
+            self._condition.notify()
+
+    def wait_for_packets(self, timeout: float | None = None) -> bool:
+        """Block until a packet is queued, capture stops, or timeout expires."""
+        with self._condition:
+            return self._condition.wait_for(
+                lambda: bool(self._queue) or self._stopped,
+                timeout=max(0.0, timeout) if timeout is not None else None,
+            ) and bool(self._queue)
 
     def __enter__(self):
         if os.name == "nt" or platform.system() != "Linux":
@@ -67,20 +79,26 @@ class ScapyAsyncCapture:
         return False
 
     def stop(self) -> None:
-        if self._stopped:
-            return
-        self._stopped = True
+        with self._condition:
+            if self._stopped:
+                return
+            self._stopped = True
+            self._condition.notify_all()
         if self._sniffer is not None:
             try:
                 self._sniffer.stop()
             except Exception:
-                # best-effort stop; swallow exceptions to allow graceful shutdown
-                pass
+                logger.exception("Failed to stop Scapy packet capture cleanly")
 
     def read_packets(self, count: int = 100) -> List[Any]:
+        return [packet for _, packet in self.read_timed_packets(count)]
+
+    def read_timed_packets(self, count: int = 100) -> List[tuple[float, Any]]:
+        """Drain captured packets together with their monotonic capture times."""
         packets: List[Any] = []
-        while len(packets) < max(1, int(count)) and self._queue:
-            packets.append(self._queue.popleft())
+        with self._condition:
+            while len(packets) < max(1, int(count)) and self._queue:
+                packets.append(self._queue.popleft())
         return packets
 
 

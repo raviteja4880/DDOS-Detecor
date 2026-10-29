@@ -141,3 +141,28 @@ def test_invalid_source_never_reaches_firewall(monkeypatch):
     monkeypatch.setattr(manager, "_is_linux", lambda: False)
     result = manager.apply_source("not-an-ip", "127.0.0.1", "lo", "invalid")
     assert result["error"] == "invalid_source"
+
+
+def test_cleanup_all_retains_local_rule_when_firewall_removal_fails(monkeypatch):
+    manager = MitigationManager({"enabled": True, "dry_run": False, "mechanism": "nftables"})
+    monkeypatch.setattr(manager, "_is_linux", lambda: True)
+    monkeypatch.setattr(manager, "_tool_available", lambda tool: True)
+    monkeypatch.setattr(manager, "_discover_nft_application_rules", lambda: [])
+    monkeypatch.setattr(
+        manager,
+        "_remove_nftables_rule",
+        lambda rule: {"success": False, "error": "cleanup_failed", "message": "permission denied"},
+    )
+    rule = MitigationRule(
+        rule_id="live-1700000000-abcdef123456",
+        rule_type="nftables",
+        target="10.0.0.1",
+        interface="veth0",
+        reason="test cleanup error",
+        backend_id="42",
+    )
+    manager.rules.append(rule)
+
+    assert manager.cleanup_all() == []
+    assert manager.rules == [rule]
+    assert manager.last_cleanup_error["message"] == "permission denied"

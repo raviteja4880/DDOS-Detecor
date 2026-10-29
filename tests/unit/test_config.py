@@ -8,6 +8,27 @@ sys.path.insert(0, str(ROOT / "src"))
 import pytest
 
 from ddos_detector.config import Config, load_config, validate_config
+from ddos_detector.mitigation import MitigationConfig, MitigationManager
+
+
+def test_mitigation_defaults_are_safe_and_consistent():
+    assert Config().mitigation["enabled"] is False
+    assert Config().mitigation["dry_run"] is True
+    assert MitigationConfig().enabled is False
+    assert MitigationConfig().dry_run is True
+    assert MitigationManager().config.enabled is False
+    assert MitigationManager().config.dry_run is True
+
+    cfg = load_config(str(ROOT / "config" / "config.yaml"))
+    assert cfg.mitigation["enabled"] is False
+    assert cfg.mitigation["dry_run"] is True
+    assert cfg.mitigation["auto_block_sources"] is False
+
+
+def test_explicit_lab_configuration_can_enable_live_mitigation():
+    cfg = validate_config(Config(mitigation={"enabled": True, "dry_run": False}))
+    assert cfg.mitigation["enabled"] is True
+    assert cfg.mitigation["dry_run"] is False
 
 
 def test_load_config_reads_values(tmp_path):
@@ -34,6 +55,13 @@ logging:
     assert cfg.capture["snaplen"] == 4096
     assert cfg.logging["level"] == "DEBUG"
     assert cfg.logging["json"] is True
+
+
+def test_load_config_rejects_non_mapping_yaml(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("- not\n- a mapping\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="configuration root must be a mapping"):
+        load_config(str(config_file))
 
 
 def test_validate_config_rejects_invalid_values():

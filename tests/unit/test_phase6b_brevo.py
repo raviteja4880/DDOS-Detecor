@@ -2,13 +2,23 @@ import sys
 import pathlib
 import pytest
 import logging
+import threading
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 import requests
 
-from ddos_detector.alerts import maybe_emit_alert, ALERT_LAST_SENT
+from ddos_detector.alerts import maybe_emit_alert, ALERT_LAST_SENT, INCIDENT_STATE, mark_normal_window
+
+
+@pytest.fixture(autouse=True)
+def clear_incident_state():
+    ALERT_LAST_SENT.clear()
+    INCIDENT_STATE.clear()
+    yield
+    ALERT_LAST_SENT.clear()
+    INCIDENT_STATE.clear()
 
 
 def test_brevo_send_and_cooldown(monkeypatch):
@@ -46,10 +56,167 @@ def test_brevo_send_and_cooldown(monkeypatch):
     maybe_emit_alert('HIGH_RISK', 0.99, ['test'], alert_cfg=cfg, clock=lambda: current_time[0])
     assert posted['count'] == 1
 
-    # simulate expiry
+    # Cooldown expiry does not re-notify an already active incident.
     current_time[0] = 161.0
     maybe_emit_alert('HIGH_RISK', 0.99, ['test'], alert_cfg=cfg, clock=lambda: current_time[0])
-    assert posted['count'] == 2
+    assert posted['count'] == 1
+
+
+def test_twenty_windows_same_incident_send_one_email(monkeypatch):
+    ALERT_LAST_SENT.clear()
+    INCIDENT_STATE.clear()
+    posted = {"count": 0}
+
+    def fake_post(url, json=None, headers=None, timeout=10):
+        posted["count"] += 1
+        class Response:
+            status_code = 201
+            text = "created"
+        return Response()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    monkeypatch.setenv("BREVO_API_KEY", "DUMMY")
+    monkeypatch.setenv("BREVO_SENDER_EMAIL", "sender@example.local")
+    monkeypatch.setenv("BREVO_ALERT_RECIPIENT", "ops@example.local")
+    cfg = {"email": {"enabled": True, "provider": "brevo"}, "cooldown_seconds": 60}
+    context = {"interface": "lo", "target_ips": ["127.0.0.1"], "target_ports": [18080]}
+
+    for window in range(20):
+        maybe_emit_alert(
+            "HIGH_RISK" if window % 3 else "SUSPICIOUS",
+            0.4 + window / 100,
+            [f"indicator-{window}"],
+            context={**context, "source_ips": [f"10.0.0.{window + 1}"]},
+            alert_cfg=cfg,
+            clock=lambda window=window: window * 61,
+        )
+
+    assert posted["count"] == 1
+
+
+def test_one_hundred_windows_same_incident_send_one_email(monkeypatch):
+    ALERT_LAST_SENT.clear()
+    INCIDENT_STATE.clear()
+    posted = {"count": 0}
+
+    def fake_post(url, json=None, headers=None, timeout=10):
+        posted["count"] += 1
+        class Response:
+            status_code = 201
+            text = "created"
+        return Response()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    monkeypatch.setenv("BREVO_API_KEY", "DUMMY")
+    monkeypatch.setenv("BREVO_SENDER_EMAIL", "sender@example.local")
+    monkeypatch.setenv("BREVO_ALERT_RECIPIENT", "ops@example.local")
+    cfg = {"email": {"enabled": True, "provider": "brevo", "cooldown_seconds": 1}}
+    context = {"interface": "lo", "target_ips": ["127.0.0.1"], "target_ports": [18080]}
+
+    for window in range(100):
+        maybe_emit_alert(
+            "HIGH_RISK",
+            0.5 + (window % 50) / 100,
+            [f"indicator-{window % 4}"],
+            context={**context, "source_ips": [f"10.0.0.{window + 1}"]},
+            alert_cfg=cfg,
+            clock=lambda window=window: window * 2,
+        )
+
+    assert posted["count"] == 1
+
+
+def test_notified_incident_is_not_rearmed_by_timestamp_store_loss(monkeypatch):
+    ALERT_LAST_SENT.clear()
+    INCIDENT_STATE.clear()
+    posted = {"count": 0}
+
+    def fake_post(url, json=None, headers=None, timeout=10):
+        posted["count"] += 1
+        class Response:
+            status_code = 201
+            text = "created"
+        return Response()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    monkeypatch.setenv("BREVO_API_KEY", "DUMMY")
+    monkeypatch.setenv("BREVO_SENDER_EMAIL", "sender@example.local")
+    monkeypatch.setenv("BREVO_ALERT_RECIPIENT", "ops@example.local")
+    cfg = {"email": {"enabled": True, "provider": "brevo"}, "cooldown_seconds": 0}
+    context = {"interface": "lo", "target_ips": ["127.0.0.1"], "target_ports": [18080]}
+
+    maybe_emit_alert("HIGH_RISK", 1.0, ["first"], context=context, alert_cfg=cfg)
+    ALERT_LAST_SENT.clear()
+    maybe_emit_alert("HIGH_RISK", 0.9, ["second"], context=context, alert_cfg=cfg)
+
+    assert posted["count"] == 1
+    assert INCIDENT_STATE[next(iter(INCIDENT_STATE))]["notified"] is True
+
+
+def test_incident_rearms_after_two_normal_windows(monkeypatch):
+    ALERT_LAST_SENT.clear()
+    INCIDENT_STATE.clear()
+    posted = {"count": 0}
+
+    def fake_post(url, json=None, headers=None, timeout=10):
+        posted["count"] += 1
+        class Response:
+            status_code = 201
+            text = "created"
+        return Response()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    monkeypatch.setenv("BREVO_API_KEY", "DUMMY")
+    monkeypatch.setenv("BREVO_SENDER_EMAIL", "sender@example.local")
+    monkeypatch.setenv("BREVO_ALERT_RECIPIENT", "ops@example.local")
+    cfg = {"email": {"enabled": True, "provider": "brevo"}, "cooldown_seconds": 60}
+    context = {"interface": "lo", "target_ips": ["127.0.0.1"], "target_ports": [18080]}
+
+    maybe_emit_alert("HIGH_RISK", 0.9, ["attack"], context=context, alert_cfg=cfg, clock=lambda: 0)
+    mark_normal_window("lo", required_windows=2)
+    mark_normal_window("lo", required_windows=2)
+    maybe_emit_alert("HIGH_RISK", 0.9, ["new attack"], context=context, alert_cfg=cfg, clock=lambda: 1)
+
+    assert posted["count"] == 2
+
+
+def test_concurrent_same_incident_notification_is_single_send(monkeypatch):
+    ALERT_LAST_SENT.clear()
+    INCIDENT_STATE.clear()
+    calls = {"count": 0}
+    entered = threading.Event()
+    release = threading.Event()
+
+    def fake_post(url, json=None, headers=None, timeout=10):
+        calls["count"] += 1
+        entered.set()
+        release.wait(timeout=2)
+        class Response:
+            status_code = 201
+            text = "created"
+        return Response()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    monkeypatch.setenv("BREVO_API_KEY", "DUMMY")
+    monkeypatch.setenv("BREVO_SENDER_EMAIL", "sender@example.local")
+    monkeypatch.setenv("BREVO_ALERT_RECIPIENT", "ops@example.local")
+    cfg = {"email": {"enabled": True, "provider": "brevo"}, "cooldown_seconds": 60}
+    context = {"interface": "lo", "target_ips": ["127.0.0.1"], "target_ports": [18080]}
+    threads = [
+        threading.Thread(
+            target=maybe_emit_alert,
+            kwargs={"classification": "HIGH_RISK", "score": 0.9, "reasons": ["attack"], "context": context, "alert_cfg": cfg},
+        )
+        for _ in range(2)
+    ]
+    threads[0].start()
+    assert entered.wait(timeout=2)
+    threads[1].start()
+    threads[1].join(timeout=2)
+    release.set()
+    threads[0].join(timeout=2)
+
+    assert calls["count"] == 1
 
 
 def test_brevo_payload_contains_contextual_incident_details(monkeypatch):
@@ -180,7 +347,7 @@ def test_brevo_diagnostics_show_first_attempt_and_cooldown(monkeypatch, caplog):
     assert "EMAIL_ATTEMPTED=true" in caplog.text
     assert "BREVO_RESPONSE_STATUS=201" in caplog.text
     assert "EMAIL_DELIVERED/ACCEPTED=true" in caplog.text
-    assert "BREVO_RESPONSE_STATUS=cooldown" in caplog.text
+    assert "BREVO_RESPONSE_STATUS=incident_active" in caplog.text
 
 
 def test_global_cooldown_spans_classification_score_and_indicators(monkeypatch, caplog):
@@ -207,7 +374,7 @@ def test_global_cooldown_spans_classification_score_and_indicators(monkeypatch, 
 
     current_time[0] = 160.0
     maybe_emit_alert("HIGH_RISK", 0.91, ["new indicator"], context=context, alert_cfg=cfg, clock=lambda: current_time[0])
-    assert calls["count"] == 2
+    assert calls["count"] == 1
 
 
 def test_separate_incident_has_independent_cooldown(monkeypatch):
@@ -280,3 +447,60 @@ def test_brevo_network_and_malformed_responses_are_non_fatal(monkeypatch, caplog
         alert_cfg={"email": {"enabled": True, "provider": "brevo"}, "cooldown_seconds": 0},
     )
     assert "monitoring continues" in caplog.text
+
+
+def test_varying_ephemeral_ports_send_only_one_email_until_recovery(monkeypatch):
+    """Live traffic continuously opens new ephemeral client ports. These changing ports
+    must not trigger new incident emails on every window. Exactly one alert should be sent
+    until the incident is resolved."""
+    ALERT_LAST_SENT.clear()
+    INCIDENT_STATE.clear()
+    posted = {"count": 0}
+
+    def fake_post(url, json=None, headers=None, timeout=10):
+        posted["count"] += 1
+        class Response:
+            status_code = 201
+            text = "created"
+        return Response()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    monkeypatch.setenv("BREVO_API_KEY", "DUMMY")
+    monkeypatch.setenv("BREVO_SENDER_EMAIL", "sender@example.local")
+    monkeypatch.setenv("BREVO_ALERT_RECIPIENT", "ops@example.local")
+    cfg = {"email": {"enabled": True, "provider": "brevo"}, "cooldown_seconds": 60}
+
+    # Simulate 15 windows with changing ephemeral ports and changing/idle target IPs
+    for i in range(15):
+        context = {
+            "interface": "lo",
+            "target_ips": ["127.0.0.1"] if i < 10 else [],
+            "target_ports": [18080, 50000 + i],
+            "source_ips": ["127.0.0.1"],
+        }
+        maybe_emit_alert(
+            "HIGH_RISK" if i == 0 else "SUSPICIOUS",
+            0.9 if i == 0 else 0.62,
+            ["packet-rate anomaly"] if i == 0 else ["destination concentration anomaly"],
+            context=context,
+            alert_cfg=cfg,
+            clock=lambda i=i: float(i),
+        )
+
+    # Exactly ONE alert must have been sent across all 15 windows
+    assert posted["count"] == 1
+
+    # Now abnormal activity resolves (2 normal windows)
+    mark_normal_window("lo", required_windows=2)
+    mark_normal_window("lo", required_windows=2)
+
+    # A subsequent abnormal activity occurs later
+    context_new = {
+        "interface": "lo",
+        "target_ips": ["127.0.0.1"],
+        "target_ports": [18080, 60001],
+    }
+    maybe_emit_alert("HIGH_RISK", 0.95, ["packet-rate anomaly"], context=context_new, alert_cfg=cfg, clock=lambda: 100.0)
+
+    # Exactly ONE new alert is sent for the new incident
+    assert posted["count"] == 2

@@ -20,6 +20,7 @@ baseline:
 detection:
   minimum_indicators: 2
   minimum_consecutive_windows: 1
+  recovery_windows: 2
 scoring:
   weights:
     syn_rate: 1.0
@@ -49,11 +50,11 @@ alerts:
     provider: brevo
     cooldown_seconds: 60
 mitigation:
-  enabled: true
-  dry_run: false
+  enabled: false
+  dry_run: true
   mechanism: nftables
   rule_ttl_seconds: 60
-  auto_block_sources: true
+  auto_block_sources: false
   max_auto_block_sources: 5
   excluded_sources: []
   # Automatic source blocking requires explicit attribution. Shared/NAT

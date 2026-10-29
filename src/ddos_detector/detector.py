@@ -33,6 +33,8 @@ class DetectionResult:
 class TrafficDetector:
     """Explainable statistical detector for distributed DDoS-like traffic patterns."""
 
+    MIN_MEANINGFUL_PACKETS_PER_SEC = 5.0
+
     @staticmethod
     def _ratio(current: float, baseline: float) -> float:
         if baseline == 0:
@@ -45,7 +47,18 @@ class TrafficDetector:
             return current > 0
         return current > baseline * threshold
 
-    def detect(self, current: WindowMetric, baseline: BaselineEngine, minimum_indicators: int = 2) -> DetectionResult:
+    def detect(
+        self,
+        current: WindowMetric,
+        baseline: BaselineEngine,
+        minimum_indicators: int = 2,
+        allow_provisional: bool = False,
+    ) -> DetectionResult:
+        """Classify a window only after baseline bootstrap is complete.
+
+        ``allow_provisional`` remains for call compatibility but cannot bypass
+        the explicit warm-up state.
+        """
         baseline_snapshot = baseline.snapshot()
         indicators: List[IndicatorResult] = []
 
@@ -63,14 +76,34 @@ class TrafficDetector:
             baseline_value = base_mean or 0.0
             deviation = self._ratio(current_value / scale, baseline_value / scale)
             triggered = self._is_anomalous(current_value / scale, baseline_value / scale)
+            low_volume_zero_baseline = (
+                baseline_value == 0.0
+                and current.packets_per_sec < self.MIN_MEANINGFUL_PACKETS_PER_SEC
+            )
+            if low_volume_zero_baseline:
+                triggered = False
+                deviation = 0.0
             if base_attr in {"syn_packets", "connection_attempts"}:
                 current_value = current_value / max(1, current.window_seconds)
                 baseline_value = baseline_value / max(1, current.window_seconds)
                 deviation = self._ratio(current_value, baseline_value)
                 triggered = self._is_anomalous(current_value, baseline_value)
+                if low_volume_zero_baseline:
+                    triggered = False
+                    deviation = 0.0
             if name == "destination concentration anomaly":
-                triggered = current.dest_concentration > max(0.15, (baseline_value * 3.0) if baseline_value else 0.15)
-                deviation = current.dest_concentration / max(0.001, baseline_value)
+                # Concentration is statistically meaningless with very few
+                # packets (e.g. 1-2 packets always yield concentration=1.0).
+                # Suppress the indicator when traffic is below the minimum
+                # volume threshold to prevent perpetual SUSPICIOUS after an
+                # attack subsides on an otherwise idle interface.
+                low_volume = current.packets_per_sec < self.MIN_MEANINGFUL_PACKETS_PER_SEC
+                if low_volume_zero_baseline or low_volume:
+                    triggered = False
+                    deviation = 0.0
+                else:
+                    triggered = current.dest_concentration > max(0.15, (baseline_value * 3.0) if baseline_value else 0.15)
+                    deviation = current.dest_concentration / max(0.001, baseline_value)
             if name == "distributed-source anomaly" and current.unique_src_ips < 2:
                 triggered = False
             explanation = (
@@ -104,6 +137,7 @@ class TrafficDetector:
                 indicator.explanation += "; baseline warm-up"
             return DetectionResult(
                 indicators=indicators,
+                classification="BASELINE_WARMUP",
                 reason="Baseline warm-up is incomplete; traffic is not classified yet.",
             )
         if triggered and len(triggered) >= max(1, minimum_indicators):
@@ -123,5 +157,15 @@ class TrafficDetector:
         return result
 
 
-def analyze_window(current: WindowMetric, baseline: BaselineEngine, minimum_indicators: int = 2) -> DetectionResult:
-    return TrafficDetector().detect(current, baseline, minimum_indicators=minimum_indicators)
+def analyze_window(
+    current: WindowMetric,
+    baseline: BaselineEngine,
+    minimum_indicators: int = 2,
+    allow_provisional: bool = False,
+) -> DetectionResult:
+    return TrafficDetector().detect(
+        current,
+        baseline,
+        minimum_indicators=minimum_indicators,
+        allow_provisional=allow_provisional,
+    )

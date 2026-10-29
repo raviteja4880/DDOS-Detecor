@@ -4,10 +4,7 @@ from typing import Any, Dict
 import logging
 from .environment import load_project_environment, missing_brevo_variables
 
-try:
-    import yaml
-except Exception:  # PyYAML may not be installed in CI; allow fallback to defaults
-    yaml = None
+import yaml
 
 
 @dataclass
@@ -20,7 +17,7 @@ class Config:
     thresholds: Dict[str, float] = field(default_factory=lambda: {"normal": 0.2, "suspicious": 0.6})
     logging: Dict[str, Any] = field(default_factory=lambda: {"level": "INFO", "json": False})
     baseline: Dict[str, Any] = field(default_factory=lambda: {"history_windows": 60, "minimum_samples": 10})
-    detection: Dict[str, Any] = field(default_factory=lambda: {"minimum_indicators": 2, "minimum_consecutive_windows": 1})
+    detection: Dict[str, Any] = field(default_factory=lambda: {"minimum_indicators": 2, "minimum_consecutive_windows": 1, "recovery_windows": 2})
     scoring: Dict[str, Any] = field(default_factory=lambda: {"weights": {"syn_rate": 1.0, "packet_rate": 0.8, "distributed_source": 1.0, "connection_rate": 0.7, "dest_concentration": 0.5}, "thresholds": {"normal": 0.2, "suspicious": 0.6}})
     simulation: Dict[str, Any] = field(default_factory=lambda: {"enabled": True, "mode": "normal", "rate_limit": 1000, "packet_limit": 50000, "target": "127.0.0.1", "max_sources": 20})
     alerts: Dict[str, Any] = field(default_factory=lambda: {"enabled": True, "console": True, "structured_logging": True, "email": {"enabled": False, "provider": "brevo", "cooldown_seconds": 60}})
@@ -32,7 +29,7 @@ DEFAULT_WEIGHTS = {"syn_rate": 1.0, "packet_rate": 0.8, "distributed_source": 1.
 DEFAULT_THRESHOLDS = {"normal": 0.2, "suspicious": 0.6}
 DEFAULT_LOGGING = {"level": "INFO", "json": False}
 DEFAULT_BASELINE = {"history_windows": 60, "minimum_samples": 10}
-DEFAULT_DETECTION = {"minimum_indicators": 2, "minimum_consecutive_windows": 1}
+DEFAULT_DETECTION = {"minimum_indicators": 2, "minimum_consecutive_windows": 1, "recovery_windows": 2}
 DEFAULT_SCORING = {"weights": DEFAULT_WEIGHTS.copy(), "thresholds": DEFAULT_THRESHOLDS.copy()}
 DEFAULT_SIMULATION = {"enabled": True, "mode": "normal", "rate_limit": 1000, "packet_limit": 50000, "target": "127.0.0.1", "max_sources": 20}
 DEFAULT_ALERTS = {"enabled": True, "console": True, "structured_logging": True, "email": {"enabled": False, "provider": "brevo", "cooldown_seconds": 60}}
@@ -120,10 +117,13 @@ def validate_config(cfg: Config) -> Config:
 
     detection_min = int(cfg.detection.get("minimum_indicators", DEFAULT_DETECTION["minimum_indicators"]))
     detection_consecutive = int(cfg.detection.get("minimum_consecutive_windows", DEFAULT_DETECTION["minimum_consecutive_windows"]))
+    recovery_windows = int(cfg.detection.get("recovery_windows", DEFAULT_DETECTION["recovery_windows"]))
     if detection_min <= 0 or detection_min > 10:
         raise ValueError("Configuration error: detection.minimum_indicators must be between 1 and 10")
     if detection_consecutive <= 0 or detection_consecutive > 20:
         raise ValueError("Configuration error: detection.minimum_consecutive_windows must be between 1 and 20")
+    if recovery_windows <= 0 or recovery_windows > 20:
+        raise ValueError("Configuration error: detection.recovery_windows must be between 1 and 20")
 
     thresholds = cfg.thresholds or DEFAULT_THRESHOLDS
     if not isinstance(thresholds, dict):
@@ -228,23 +228,14 @@ def validate_config(cfg: Config) -> Config:
 
 
 def load_config(path: str) -> Config:
-    """Load YAML config if available, otherwise return defaults."""
+    """Load and validate the YAML configuration."""
     cfg = Config()
     load_project_environment(path)
     try:
-        if yaml is not None:
-            with open(path, "r", encoding="utf-8") as f:
-                raw = yaml.safe_load(f) or {}
-        else:
-            raw = {}
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    if ":" in line:
-                        k, v = line.split(":", 1)
-                        raw[k.strip()] = v.strip().strip('"')
+        with open(path, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+        if not isinstance(raw, dict):
+            raise ValueError("configuration root must be a mapping")
         cfg.interface = raw.get("interface", cfg.interface)
         cfg.window_seconds = int(raw.get("window_seconds", cfg.window_seconds))
         cfg.slide_seconds = int(raw.get("slide_seconds", cfg.slide_seconds))
@@ -270,6 +261,6 @@ def load_config(path: str) -> Config:
         cfg.simulation = DEFAULT_SIMULATION.copy()
         cfg.alerts = DEFAULT_ALERTS.copy()
         cfg.mitigation = DEFAULT_MITIGATION.copy()
-    except (TypeError, ValueError, OSError) as exc:
+    except (TypeError, ValueError, OSError, yaml.YAMLError) as exc:
         raise ValueError(f"Configuration file could not be parsed: {exc}") from exc
     return validate_config(cfg)

@@ -94,6 +94,19 @@ def test_explicitly_attributable_source_can_be_scoped_for_mitigation():
     assert manager.rules[0].target == "192.0.2.20"
 
 
+def test_exact_attributable_source_overrides_broader_shared_network():
+    manager = MitigationManager({
+        "enabled": True,
+        "dry_run": True,
+        "attributable_sources": ["10.200.0.2/32"],
+    })
+
+    decision = manager.assess_source_attribution("10.200.0.2")
+
+    assert decision["attributable"] is True
+    assert decision["shared_or_nat"] is False
+
+
 def test_excluded_source_never_becomes_attributable():
     manager = MitigationManager({
         "enabled": True,

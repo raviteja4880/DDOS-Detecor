@@ -69,3 +69,22 @@ def test_score_and_classify_is_deterministic():
     first = score_and_classify(indicators)
     second = score_and_classify(indicators)
     assert first == second
+
+
+def test_untriggered_indicators_yield_zero_score_and_normal_classification():
+    """When indicators are not triggered (e.g. idle/low-volume traffic with zero baseline),
+    the score must be 0.0 and classification must be NORMAL, avoiding false SUSPICIOUS
+    loops that block recovery."""
+    indicators = [
+        IndicatorResult("packet-rate anomaly", 1.6, 0.0, 0.0, False, "normal"),
+        IndicatorResult("byte-rate anomaly", 204.8, 0.0, 0.0, False, "normal"),
+        IndicatorResult("SYN-rate anomaly", 0.0, 0.0, 0.0, False, "normal"),
+        IndicatorResult("connection-rate anomaly", 0.0, 0.0, 0.0, False, "normal"),
+        IndicatorResult("distributed-source anomaly", 1.0, 0.0, 0.0, False, "normal"),
+        IndicatorResult("destination concentration anomaly", 1.0, 0.0, 0.0, False, "normal"),
+    ]
+    score = score_indicators(indicators)
+    assert score == 0.0
+    score, classification = score_and_classify(indicators)
+    assert score == 0.0
+    assert classification == "NORMAL"
