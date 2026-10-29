@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import platform
+import socket
 import sys
 import time
 from collections import deque
@@ -214,6 +215,29 @@ def _run_alert(args, cfg):
     return 0
 
 
+def _interface_exists(interface: str) -> bool:
+    if not interface or not isinstance(interface, str):
+        return False
+    candidate = interface.strip()
+    if (
+        not candidate
+        or candidate != interface
+        or "/" in candidate
+        or "\\" in candidate
+        or candidate in {".", ".."}
+    ):
+        return False
+    if os.path.isdir(f"/sys/class/net/{candidate}"):
+        return True
+    if_nametoindex = getattr(socket, "if_nametoindex", None)
+    if not callable(if_nametoindex):
+        return False
+    try:
+        return int(if_nametoindex(candidate)) > 0
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def _run_monitor(args, cfg, capture_factory=None):
     if capture_factory is None:
         capture_factory = open_capture
@@ -225,7 +249,7 @@ def _run_monitor(args, cfg, capture_factory=None):
     if not interface:
         print("No interface was provided and no default interface is configured.", file=sys.stderr)
         return 2
-    if not os.path.isdir(f"/sys/class/net/{interface}"):
+    if not _interface_exists(interface):
         print(f"Interface '{interface}' does not exist on this Linux host.", file=sys.stderr)
         return 2
 

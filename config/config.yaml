@@ -46,7 +46,7 @@ alerts:
   console: true
   structured_logging: true
   email:
-    enabled: true
+    enabled: false
     provider: brevo
     cooldown_seconds: 60
 mitigation:

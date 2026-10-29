@@ -1,0 +1,6 @@
+scapy<2.6.0,>=2.4.5
+PyYAML>=6.0
+requests>=2.31.0
+
+[test]
+pytest>=7.0.0

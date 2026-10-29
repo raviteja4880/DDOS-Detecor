@@ -3,3 +3,8 @@ Name: distributed-ddos-detector
 Version: 0.1.0
 Summary: Educational distributed DDoS detection prototype with explainable rules and safe lab-only mitigation
 Requires-Python: >=3.10
+Requires-Dist: scapy<2.6.0,>=2.4.5
+Requires-Dist: PyYAML>=6.0
+Requires-Dist: requests>=2.31.0
+Provides-Extra: test
+Requires-Dist: pytest>=7.0.0; extra == "test"

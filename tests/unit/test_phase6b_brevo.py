@@ -544,3 +544,133 @@ def test_missing_brevo_configuration_is_safe_and_retryable(monkeypatch, caplog):
 
     assert len(calls) == 1
     assert "test-only-placeholder" not in caplog.text
+
+
+def test_cross_restart_suppresses_duplicate_until_recovered_and_never_stores_secrets(
+    monkeypatch, tmp_path
+):
+    from ddos_detector.alerts import reset_memory_state_for_restart
+
+    state_file = tmp_path / "alert_state.json"
+    monkeypatch.setenv("DDOS_DETECTOR_ALERT_STATE_FILE", str(state_file))
+    ALERT_LAST_SENT.clear()
+    INCIDENT_STATE.clear()
+
+    secret_key = "xkeysib-do-not-persist-me-999"
+    monkeypatch.setenv("BREVO_API_KEY", secret_key)
+    monkeypatch.setenv("BREVO_SENDER_EMAIL", "sender@example.test")
+    monkeypatch.setenv("BREVO_ALERT_RECIPIENT", "recipient@example.test")
+
+    calls = []
+
+    class Accepted:
+        status_code = 201
+        text = "created"
+
+    monkeypatch.setattr(requests, "post", lambda url, **kw: calls.append(url) or Accepted())
+
+    cfg = {"email": {"enabled": True, "provider": "brevo"}, "cooldown_seconds": 60}
+    context = {"interface": "lo", "target_ips": ["127.0.0.1"], "target_ports": [8080]}
+
+    # Process 1 sends initial notification
+    maybe_emit_alert("HIGH_RISK", 0.92, ["SYN-rate anomaly"], context=context, alert_cfg=cfg, clock=lambda: 1000.0)
+    assert len(calls) == 1
+    assert state_file.is_file()
+    persisted_raw = state_file.read_text(encoding="utf-8")
+    assert secret_key not in persisted_raw
+    assert "sender@example.test" not in persisted_raw
+    assert "recipient@example.test" not in persisted_raw
+    assert "SYN-rate anomaly" not in persisted_raw
+
+    # Simulate monitor process restart: wipe in-memory dictionaries only
+    reset_memory_state_for_restart()
+    assert not INCIDENT_STATE
+    assert not ALERT_LAST_SENT
+
+    # Process 2 sees the same active incident after restart -> suppressed!
+    maybe_emit_alert("HIGH_RISK", 0.95, ["SYN-rate anomaly"], context=context, alert_cfg=cfg, clock=lambda: 1080.0)
+    assert len(calls) == 1
+
+    # One normal window before another restart is also preserved across restart
+    mark_normal_window("lo", required_windows=2)
+    reset_memory_state_for_restart()
+    mark_normal_window("lo", required_windows=2)
+
+    # After 2 consecutive normal windows across restart, incident is re-armed
+    maybe_emit_alert("HIGH_RISK", 0.96, ["SYN-rate anomaly"], context=context, alert_cfg=cfg, clock=lambda: 1200.0)
+    assert len(calls) == 2
+
+
+def test_corrupt_state_file_fails_safely_and_does_not_block_alert(monkeypatch, tmp_path, caplog):
+    state_file = tmp_path / "corrupt_state.json"
+    state_file.write_text("{not valid json", encoding="utf-8")
+    monkeypatch.setenv("DDOS_DETECTOR_ALERT_STATE_FILE", str(state_file))
+    monkeypatch.setenv("BREVO_API_KEY", "test-only-placeholder")
+    monkeypatch.setenv("BREVO_SENDER_EMAIL", "sender@example.test")
+    monkeypatch.setenv("BREVO_ALERT_RECIPIENT", "recipient@example.test")
+
+    calls = []
+
+    class Accepted:
+        status_code = 201
+        text = "created"
+
+    monkeypatch.setattr(requests, "post", lambda url, **kw: calls.append(url) or Accepted())
+    cfg = {"email": {"enabled": True, "provider": "brevo"}, "cooldown_seconds": 60}
+    context = {"interface": "lo", "target_ips": ["127.0.0.1"]}
+
+    alert = maybe_emit_alert("HIGH_RISK", 0.91, ["packet-rate anomaly"], context=context, alert_cfg=cfg, clock=lambda: 500.0)
+    assert alert is not None
+    assert len(calls) == 1
+    assert "Corrupt or unreadable alert state file" in caplog.text
+
+
+def test_crashed_in_flight_lease_expires_and_does_not_suppress_forever(monkeypatch, tmp_path):
+    import json as _json
+    from ddos_detector.alerts import IN_FLIGHT_LEASE_SECONDS, _incident_key, reset_memory_state_for_restart
+
+    state_file = tmp_path / "lease_state.json"
+    monkeypatch.setenv("DDOS_DETECTOR_ALERT_STATE_FILE", str(state_file))
+    monkeypatch.setenv("BREVO_API_KEY", "test-only-placeholder")
+    monkeypatch.setenv("BREVO_SENDER_EMAIL", "sender@example.test")
+    monkeypatch.setenv("BREVO_ALERT_RECIPIENT", "recipient@example.test")
+
+    context = {"interface": "lo", "target_ips": ["127.0.0.1"]}
+    key = _incident_key(context)
+    # Simulate a process that crashed while an email was in flight at t=100.0
+    state_file.write_text(
+        _json.dumps({
+            "version": 1,
+            "incidents": {
+                key: {
+                    "interface": "lo",
+                    "notified": False,
+                    "normal_windows": 0,
+                    "targets": ["127.0.0.1"],
+                    "in_flight_until": 100.0 + IN_FLIGHT_LEASE_SECONDS,
+                    "updated_at": 100.0,
+                }
+            },
+            "last_sent": {},
+        }),
+        encoding="utf-8",
+    )
+    reset_memory_state_for_restart()
+
+    calls = []
+
+    class Accepted:
+        status_code = 201
+        text = "created"
+
+    monkeypatch.setattr(requests, "post", lambda url, **kw: calls.append(url) or Accepted())
+    cfg = {"email": {"enabled": True, "provider": "brevo"}, "cooldown_seconds": 60}
+
+    # During active lease (t=110.0), duplicate send from another process is suppressed
+    maybe_emit_alert("HIGH_RISK", 0.9, ["test"], context=context, alert_cfg=cfg, clock=lambda: 110.0)
+    assert len(calls) == 0
+
+    # After lease expires (t=135.0), crashed un-notified incident retries and succeeds
+    maybe_emit_alert("HIGH_RISK", 0.9, ["test"], context=context, alert_cfg=cfg, clock=lambda: 135.0)
+    assert len(calls) == 1
+

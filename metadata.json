@@ -1,0 +1,5 @@
+{
+  "name": "Distributed DDoS Detection Engine",
+  "description": "Explainable statistical and rule-based distributed DDoS detection, alerting, and conservative lab mitigation prototype in Python.",
+  "requestFramePermissions": []
+}

@@ -7,6 +7,7 @@ src/ddos_detector/alerts.py
 src/ddos_detector/baseline.py
 src/ddos_detector/config.py
 src/ddos_detector/detector.py
+src/ddos_detector/environment.py
 src/ddos_detector/feature_extractor.py
 src/ddos_detector/logging_config.py
 src/ddos_detector/main.py
@@ -20,4 +21,5 @@ src/ddos_detector/simulator.py
 src/distributed_ddos_detector.egg-info/PKG-INFO
 src/distributed_ddos_detector.egg-info/SOURCES.txt
 src/distributed_ddos_detector.egg-info/dependency_links.txt
+src/distributed_ddos_detector.egg-info/requires.txt
 src/distributed_ddos_detector.egg-info/top_level.txt

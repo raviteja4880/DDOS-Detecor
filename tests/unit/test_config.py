@@ -23,6 +23,8 @@ def test_mitigation_defaults_are_safe_and_consistent():
     assert cfg.mitigation["enabled"] is False
     assert cfg.mitigation["dry_run"] is True
     assert cfg.mitigation["auto_block_sources"] is False
+    assert Config().alerts["email"]["enabled"] is False
+    assert cfg.alerts["email"]["enabled"] is False
 
 
 def test_explicit_lab_configuration_can_enable_live_mitigation():
@@ -107,3 +109,47 @@ def test_project_local_env_is_loaded_without_overriding_process(monkeypatch, tmp
     load_project_environment(str(config_path))
     assert os.environ["BREVO_API_KEY"] == "local-key"
     assert os.environ["BREVO_SENDER_EMAIL"] == "process@example.com"
+
+
+def test_default_and_missing_email_config_do_not_send_requests(monkeypatch):
+    import requests
+    from ddos_detector.alerts import ALERT_LAST_SENT, INCIDENT_STATE, maybe_emit_alert
+
+    ALERT_LAST_SENT.clear()
+    INCIDENT_STATE.clear()
+    calls = []
+    monkeypatch.setattr(
+        requests,
+        "post",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    # 1. Committed config has email disabled by default: even if env vars exist, no request is sent.
+    monkeypatch.setenv("BREVO_API_KEY", "test-placeholder-key")
+    monkeypatch.setenv("BREVO_SENDER_EMAIL", "sender@example.invalid")
+    monkeypatch.setenv("BREVO_ALERT_RECIPIENT", "recipient@example.invalid")
+    committed_cfg = load_config(str(ROOT / "config" / "config.yaml"))
+    assert committed_cfg.alerts["email"]["enabled"] is False
+    maybe_emit_alert(
+        "HIGH_RISK",
+        0.95,
+        ["packet-rate anomaly"],
+        alert_cfg=committed_cfg.alerts,
+        context={"interface": "lo", "target_ips": ["127.0.0.1"]},
+    )
+    assert calls == []
+
+    # 2. Email explicitly enabled but missing credentials: no request is sent.
+    ALERT_LAST_SENT.clear()
+    INCIDENT_STATE.clear()
+    for name in ("BREVO_API_KEY", "BREVO_SENDER_EMAIL", "BREVO_SENDER_NAME", "BREVO_ALERT_RECIPIENT"):
+        monkeypatch.delenv(name, raising=False)
+    maybe_emit_alert(
+        "HIGH_RISK",
+        0.95,
+        ["packet-rate anomaly"],
+        alert_cfg={"enabled": True, "email": {"enabled": True, "provider": "brevo"}},
+        context={"interface": "lo", "target_ips": ["127.0.0.1"]},
+    )
+    assert calls == []
+

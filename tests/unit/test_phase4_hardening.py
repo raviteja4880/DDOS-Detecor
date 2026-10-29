@@ -365,3 +365,49 @@ def test_monitor_uses_detected_normal_window(monkeypatch, tmp_path):
     cfg = Config(interface="lo")
     result = _run_monitor(type("Args", (), {"interface": "lo"})(), cfg)
     assert result == 0
+
+
+def test_interface_exists_sysfs_present(monkeypatch):
+    manager = MitigationManager({"enabled": True, "dry_run": True})
+    monkeypatch.setattr(
+        "ddos_detector.mitigation.os.path.isdir",
+        lambda path: path == "/sys/class/net/eth0",
+    )
+    monkeypatch.setattr(
+        "ddos_detector.mitigation.socket.if_nametoindex",
+        lambda name: (_ for _ in ()).throw(OSError("should not be called when sysfs is present")),
+        raising=False,
+    )
+    assert manager._interface_exists("eth0") is True
+
+
+def test_interface_exists_sysfs_absent_falls_back_to_if_nametoindex(monkeypatch):
+    manager = MitigationManager({"enabled": True, "dry_run": True})
+    monkeypatch.setattr("ddos_detector.mitigation.os.path.isdir", lambda path: False)
+    monkeypatch.setattr(
+        "ddos_detector.mitigation.socket.if_nametoindex",
+        lambda name: 1 if name == "lo" else (_ for _ in ()).throw(OSError("no such device")),
+        raising=False,
+    )
+    assert manager._interface_exists("lo") is True
+
+
+def test_interface_exists_rejects_nonexistent_and_malformed_names(monkeypatch):
+    manager = MitigationManager({"enabled": True, "dry_run": True})
+    monkeypatch.setattr("ddos_detector.mitigation.os.path.isdir", lambda path: False)
+
+    def fake_if_nametoindex(name):
+        raise OSError(19, "No such device")
+
+    monkeypatch.setattr(
+        "ddos_detector.mitigation.socket.if_nametoindex",
+        fake_if_nametoindex,
+        raising=False,
+    )
+    assert manager._interface_exists("missing0") is False
+    assert manager._interface_exists("") is False
+    assert manager._interface_exists(" lo ") is False
+    assert manager._interface_exists("../lo") is False
+    assert manager._interface_exists("lo/bad") is False
+    assert manager._interface_exists("..") is False
+

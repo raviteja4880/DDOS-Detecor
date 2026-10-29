@@ -6,6 +6,7 @@ import os
 import platform
 import re
 import shutil
+import socket
 import subprocess
 import uuid
 from dataclasses import dataclass, field
@@ -290,9 +291,26 @@ class MitigationManager:
         return os.name == "posix" and platform.system() == "Linux"
 
     def _interface_exists(self, interface: str) -> bool:
-        if not interface:
+        if not interface or not isinstance(interface, str):
             return False
-        return os.path.isdir(f"/sys/class/net/{interface}")
+        candidate = interface.strip()
+        if (
+            not candidate
+            or candidate != interface
+            or "/" in candidate
+            or "\\" in candidate
+            or candidate in {".", ".."}
+        ):
+            return False
+        if os.path.isdir(f"/sys/class/net/{candidate}"):
+            return True
+        if_nametoindex = getattr(socket, "if_nametoindex", None)
+        if not callable(if_nametoindex):
+            return False
+        try:
+            return int(if_nametoindex(candidate)) > 0
+        except (OSError, ValueError, TypeError):
+            return False
 
     def _has_root_privileges(self) -> bool:
         if os.name != "posix":

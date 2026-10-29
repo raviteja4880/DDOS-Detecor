@@ -481,10 +481,14 @@ Offender history is bounded and in-memory only; it expires after
 `history_ttl_seconds` and resets on process restart. Active nftables rules
 remain detector-owned and discoverable after restart, so cleanup can remove
 them safely. Brevo alert cooldown/deduplication remains independent of
-mitigation history. Alert incident state is process-local: separate detector
-processes and process restarts do not share notification deduplication state,
-so a restarted or concurrently launched process can send a duplicate incident
-notification. Persistent cross-process incident state is not implemented.
+mitigation history. Alert incident state is persisted in a bounded local JSON
+state file (`ddos_detector_alert_state.json`, configurable via
+`DDOS_DETECTOR_ALERT_STATE_FILE`) using atomic file replacement (`os.replace`),
+`0600` permissions where supported, a 30-second in-flight lease, and Linux
+`fcntl.flock` coordination. This prevents duplicate incident emails across
+monitor restarts while still re-arming after the configured number of
+consecutive `NORMAL` windows. On Windows (where `fcntl` is unavailable),
+coordination falls back to in-process locking and atomic file replacement.
 
 ### Phase 2 validation evidence
 

@@ -51,18 +51,306 @@ def emit_console_alert(alert: Dict[str, Any]) -> None:
         print(f"- {reason}")
 
 
+from contextlib import contextmanager
 import os
 import smtplib
+import tempfile
 import threading
 import time
 from email.message import EmailMessage
 from typing import Callable
 
-# In-memory incident-scoped cooldown store: stable incident key -> last accepted epoch.
-ALERT_LAST_SENT: Dict[str, float] = {}
-INCIDENT_STATE: Dict[str, Dict[str, Any]] = {}
-EMAIL_IN_FLIGHT: set[str] = set()
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None  # type: ignore[assignment]
+
+MAX_PERSISTED_INCIDENTS = 100
+MAX_STATE_FILE_BYTES = 65536
+IN_FLIGHT_LEASE_SECONDS = 30.0
+MAX_INCIDENT_AGE_SECONDS = 86400.0
+
 ALERT_COOLDOWN_LOCK = threading.RLock()
+EMAIL_IN_FLIGHT: set[str] = set()
+_SYNCING_MEMORY = False
+
+
+def _state_file_path(alert_cfg: Dict[str, Any] | None = None) -> str:
+    if isinstance(alert_cfg, dict):
+        direct = alert_cfg.get("state_file")
+        if isinstance(direct, str) and direct.strip():
+            return direct.strip()
+        email_cfg = alert_cfg.get("email")
+        if isinstance(email_cfg, dict):
+            nested = email_cfg.get("state_file")
+            if isinstance(nested, str) and nested.strip():
+                return nested.strip()
+    env_path = os.environ.get("DDOS_DETECTOR_ALERT_STATE_FILE", "").strip()
+    if env_path:
+        return env_path
+    base_dir = os.environ.get("DDOS_DETECTOR_LOCK_DIR", "").strip() or tempfile.gettempdir()
+    return os.path.join(base_dir, "ddos_detector_alert_state.json")
+
+
+@contextmanager
+def _alert_state_file_lock(state_path: str):
+    with ALERT_COOLDOWN_LOCK:
+        if fcntl is None:
+            yield
+            return
+        lock_path = f"{state_path}.lock"
+        lock_fd: int | None = None
+        try:
+            parent = os.path.dirname(os.path.abspath(lock_path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                os.chmod(lock_path, 0o600)
+            except OSError:
+                pass
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        except OSError as exc:
+            logger.debug("Alert state lock unavailable for %s: %s", lock_path, exc)
+            if lock_fd is not None:
+                try:
+                    os.close(lock_fd)
+                except OSError:
+                    pass
+                lock_fd = None
+        try:
+            yield
+        finally:
+            if lock_fd is not None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                try:
+                    os.close(lock_fd)
+                except OSError:
+                    pass
+
+
+def _read_state_file_unlocked(state_path: str, now: float | None = None) -> Dict[str, Any]:
+    empty: Dict[str, Any] = {"incidents": {}, "last_sent": {}}
+    if not state_path or not os.path.isfile(state_path):
+        return empty
+    try:
+        size = os.path.getsize(state_path)
+        if size <= 0:
+            return empty
+        if size > MAX_STATE_FILE_BYTES:
+            logger.warning("Alert state file %s exceeds %d bytes; ignoring persisted state", state_path, MAX_STATE_FILE_BYTES)
+            return empty
+        with open(state_path, "r", encoding="utf-8") as state_file:
+            payload = json.load(state_file)
+    except (OSError, ValueError, TypeError) as exc:
+        logger.warning("Corrupt or unreadable alert state file %s (%s); starting clean", state_path, exc)
+        return empty
+
+    if not isinstance(payload, dict):
+        logger.warning("Invalid alert state root in %s; starting clean", state_path)
+        return empty
+
+    raw_incidents = payload.get("incidents")
+    raw_last_sent = payload.get("last_sent")
+    if not isinstance(raw_incidents, dict) or not isinstance(raw_last_sent, dict):
+        logger.warning("Malformed alert state structure in %s; starting clean", state_path)
+        return empty
+
+    incidents: Dict[str, Dict[str, Any]] = {}
+    for key, entry in raw_incidents.items():
+        if not isinstance(key, str) or not isinstance(entry, dict):
+            continue
+        try:
+            updated_at = float(entry.get("updated_at", 0.0) or 0.0)
+            in_flight_until = float(entry.get("in_flight_until", 0.0) or 0.0)
+            normal_windows = max(0, int(entry.get("normal_windows", 0) or 0))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if now is not None and updated_at > 0.0 and now >= updated_at and (now - updated_at) > MAX_INCIDENT_AGE_SECONDS:
+            continue
+        raw_targets = entry.get("targets") or []
+        if not isinstance(raw_targets, (list, tuple, set)):
+            raw_targets = []
+        incidents[key] = {
+            "interface": str(entry.get("interface") or "unknown"),
+            "notified": bool(entry.get("notified", False)),
+            "normal_windows": normal_windows,
+            "targets": {str(item) for item in raw_targets if item is not None},
+            "in_flight_until": in_flight_until if in_flight_until > 0.0 else 0.0,
+            "updated_at": updated_at,
+        }
+
+    if len(incidents) > MAX_PERSISTED_INCIDENTS:
+        ordered_keys = sorted(
+            incidents,
+            key=lambda k: float(incidents[k].get("updated_at", 0.0) or 0.0),
+        )
+        for stale_key in ordered_keys[: len(incidents) - MAX_PERSISTED_INCIDENTS]:
+            incidents.pop(stale_key, None)
+
+    last_sent: Dict[str, float] = {}
+    for key, ts in raw_last_sent.items():
+        if not isinstance(key, str) or isinstance(ts, bool) or not isinstance(ts, (int, float)):
+            continue
+        ts_val = float(ts)
+        if now is not None and ts_val > 0.0 and now >= ts_val and (now - ts_val) > MAX_INCIDENT_AGE_SECONDS:
+            continue
+        last_sent[key] = ts_val
+
+    if len(last_sent) > MAX_PERSISTED_INCIDENTS:
+        ordered_sent = sorted(last_sent, key=lambda k: last_sent[k])
+        for stale_key in ordered_sent[: len(last_sent) - MAX_PERSISTED_INCIDENTS]:
+            last_sent.pop(stale_key, None)
+
+    return {"incidents": incidents, "last_sent": last_sent}
+
+
+def _write_state_file_unlocked(
+    state_path: str,
+    incidents: Dict[str, Dict[str, Any]],
+    last_sent: Dict[str, float],
+) -> None:
+    if not state_path:
+        return
+    serializable_incidents: Dict[str, Dict[str, Any]] = {}
+    items = list(incidents.items())
+    if len(items) > MAX_PERSISTED_INCIDENTS:
+        items = sorted(
+            items,
+            key=lambda kv: float((kv[1] or {}).get("updated_at", 0.0) or 0.0),
+        )[-MAX_PERSISTED_INCIDENTS:]
+    for key, state in items:
+        if not isinstance(key, str) or not isinstance(state, dict):
+            continue
+        targets = state.get("targets") or set()
+        serializable_incidents[key] = {
+            "interface": str(state.get("interface") or "unknown"),
+            "notified": bool(state.get("notified", False)),
+            "normal_windows": max(0, int(state.get("normal_windows", 0) or 0)),
+            "targets": sorted(str(item) for item in targets if item is not None),
+            "in_flight_until": float(state.get("in_flight_until", 0.0) or 0.0),
+            "updated_at": float(state.get("updated_at", 0.0) or 0.0),
+        }
+
+    serializable_last_sent: Dict[str, float] = {}
+    sent_items = [
+        (k, float(v))
+        for k, v in last_sent.items()
+        if isinstance(k, str) and not isinstance(v, bool) and isinstance(v, (int, float))
+    ]
+    if len(sent_items) > MAX_PERSISTED_INCIDENTS:
+        sent_items = sorted(sent_items, key=lambda kv: kv[1])[-MAX_PERSISTED_INCIDENTS:]
+    for key, ts_val in sent_items:
+        serializable_last_sent[key] = ts_val
+
+    payload = {
+        "version": 1,
+        "incidents": serializable_incidents,
+        "last_sent": serializable_last_sent,
+    }
+    tmp_path: str | None = None
+    try:
+        parent = os.path.dirname(os.path.abspath(state_path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".ddos_alert_state_",
+            suffix=".tmp",
+            dir=parent or None,
+        )
+        try:
+            try:
+                os.chmod(tmp_path, 0o600)
+            except OSError:
+                pass
+            with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+                json.dump(payload, tmp_file, sort_keys=True)
+                tmp_file.flush()
+                os.fsync(tmp_file.fileno())
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        os.replace(tmp_path, state_path)
+        try:
+            os.chmod(state_path, 0o600)
+        except OSError:
+            pass
+    except OSError as exc:
+        logger.debug("Unable to persist alert state to %s: %s", state_path, exc)
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+class _SyncedStateDict(dict):
+    """Dictionary wrapper keeping in-memory alert state and local state file aligned."""
+
+    def _sync_Write(self) -> None:
+        if _SYNCING_MEMORY:
+            return
+        state_path = _state_file_path()
+        with _alert_state_file_lock(state_path):
+            _write_state_file_unlocked(state_path, INCIDENT_STATE, ALERT_LAST_SENT)
+
+    def clear(self) -> None:
+        super().clear()
+        self._sync_Write()
+
+    def __setitem__(self, key, value) -> None:
+        super().__setitem__(key, value)
+        self._sync_Write()
+
+    def __delitem__(self, key) -> None:
+        super().__delitem__(key)
+        self._sync_Write()
+
+    def pop(self, key, *args):
+        result = super().pop(key, *args)
+        self._sync_Write()
+        return result
+
+    def update(self, *args, **kwargs) -> None:
+        super().update(*args, **kwargs)
+        self._sync_Write()
+
+
+# Incident-scoped cooldown and state stores synchronized with bounded local file state.
+ALERT_LAST_SENT: Dict[str, float] = _SyncedStateDict()
+INCIDENT_STATE: Dict[str, Dict[str, Any]] = _SyncedStateDict()
+
+
+def _sync_from_disk_unlocked(state_path: str, now: float | None = None) -> None:
+    global _SYNCING_MEMORY
+    loaded = _read_state_file_unlocked(state_path, now=now)
+    _SYNCING_MEMORY = True
+    try:
+        dict.clear(INCIDENT_STATE)
+        dict.update(INCIDENT_STATE, loaded["incidents"])
+        dict.clear(ALERT_LAST_SENT)
+        dict.update(ALERT_LAST_SENT, loaded["last_sent"])
+    finally:
+        _SYNCING_MEMORY = False
+
+
+def reset_memory_state_for_restart() -> None:
+    """Clear only in-process memory without erasing the persisted state file."""
+    global _SYNCING_MEMORY
+    with ALERT_COOLDOWN_LOCK:
+        _SYNCING_MEMORY = True
+        try:
+            dict.clear(INCIDENT_STATE)
+            dict.clear(ALERT_LAST_SENT)
+            EMAIL_IN_FLIGHT.clear()
+        finally:
+            _SYNCING_MEMORY = False
 
 
 def _incident_data(alert: Dict[str, Any]) -> Dict[str, Any]:
@@ -257,20 +545,30 @@ def _incident_key(context: Dict[str, Any] | None) -> str:
     return json.dumps({"interface": interface, "target_ips": targets}, sort_keys=True)
 
 
-def mark_normal_window(interface: str, required_windows: int = 2) -> None:
+def mark_normal_window(
+    interface: str,
+    required_windows: int = 2,
+    alert_cfg: Dict[str, Any] | None = None,
+) -> None:
     """Re-arm incidents after consecutive normal windows on an interface."""
     required = max(1, int(required_windows))
-    with ALERT_COOLDOWN_LOCK:
+    state_path = _state_file_path(alert_cfg)
+    with _alert_state_file_lock(state_path):
+        _sync_from_disk_unlocked(state_path)
+        changed = False
         for key, state in list(INCIDENT_STATE.items()):
             if state.get("interface") != str(interface):
                 continue
             state["normal_windows"] = int(state.get("normal_windows", 0)) + 1
+            changed = True
             if state["normal_windows"] < required:
                 continue
-            INCIDENT_STATE.pop(key, None)
-            ALERT_LAST_SENT.pop(key, None)
+            dict.pop(INCIDENT_STATE, key, None)
+            dict.pop(ALERT_LAST_SENT, key, None)
             logger.info("INCIDENT_RECOVERED incident=%s", key)
             logger.info("INCIDENT_REARMED incident=%s", key)
+        if changed:
+            _write_state_file_unlocked(state_path, INCIDENT_STATE, ALERT_LAST_SENT)
 
 
 def _send_email_via_brevo(alert: Dict[str, Any], brevo_config: Dict[str, Any]) -> Dict[str, Any]:
@@ -406,14 +704,16 @@ def maybe_emit_alert(
     interface = str(context.get("interface") or "unknown")
     targets = tuple(sorted(str(item) for item in (context.get("target_ips") or [])))
     incident_key = _incident_key(context)
-    now = (clock or time.time)()
+    now = float((clock or time.time)())
+    state_path = _state_file_path(alert_cfg if isinstance(alert_cfg, dict) else None)
 
     email_configuration_valid = True
     email_cooldown_allowed = False
     email_attempted = False
     email_result: Dict[str, Any] = {"delivered": False, "status": "not_enabled", "reason": "email_disabled"}
     should_send = False
-    with ALERT_COOLDOWN_LOCK:
+    with _alert_state_file_lock(state_path):
+        _sync_from_disk_unlocked(state_path, now=now)
         state = INCIDENT_STATE.get(incident_key)
         # Check if an ongoing incident on this interface is already active/notified
         if state is None:
@@ -422,7 +722,7 @@ def maybe_emit_alert(
                     existing_targets = existing_state.get("targets", set())
                     # If current window has no specific targets, or existing has no targets,
                     # or targets overlap, link to the existing active incident
-                    if not targets or not existing_targets or (set(targets) & existing_targets):
+                    if not targets or not existing_targets or (set(targets) & set(existing_targets)):
                         incident_key = existing_key
                         state = existing_state
                         break
@@ -433,25 +733,37 @@ def maybe_emit_alert(
                 "notified": False,
                 "normal_windows": 0,
                 "targets": set(targets),
+                "in_flight_until": 0.0,
+                "updated_at": now,
             }
-            INCIDENT_STATE[incident_key] = state
+            dict.__setitem__(INCIDENT_STATE, incident_key, state)
             logger.info("INCIDENT_STARTED incident=%s", incident_key)
         state["normal_windows"] = 0
+        state["updated_at"] = now
+        if targets:
+            state["targets"] = set(state.get("targets") or set()) | set(targets)
+        in_flight_until = float(state.get("in_flight_until", 0.0) or 0.0)
+        is_in_flight = (
+            incident_key in EMAIL_IN_FLIGHT
+            or (in_flight_until > 0.0 and 0.0 <= (in_flight_until - now) <= IN_FLIGHT_LEASE_SECONDS)
+        )
         if email_enabled:
             if state.get("notified"):
                 email_result = {"delivered": False, "status": "incident_active", "reason": "duplicate_incident"}
                 logger.info("EMAIL_SUPPRESSED_DUPLICATE incident=%s", incident_key)
-            elif incident_key in EMAIL_IN_FLIGHT:
+            elif is_in_flight:
                 email_result = {"delivered": False, "status": "in_flight", "reason": "duplicate_in_flight"}
                 logger.info("EMAIL_SUPPRESSED_IN_FLIGHT incident=%s", incident_key)
             else:
                 last_sent = ALERT_LAST_SENT.get(incident_key)
-                if last_sent is not None and now - last_sent < cooldown_seconds:
+                if last_sent is not None and 0 <= now - last_sent < cooldown_seconds:
                     email_result = {"delivered": False, "status": "cooldown", "reason": "cooldown"}
                 else:
                     email_cooldown_allowed = True
                     EMAIL_IN_FLIGHT.add(incident_key)
+                    state["in_flight_until"] = now + IN_FLIGHT_LEASE_SECONDS
                     should_send = True
+        _write_state_file_unlocked(state_path, INCIDENT_STATE, ALERT_LAST_SENT)
 
     if should_send:
         if email_provider == "brevo":
@@ -465,13 +777,18 @@ def maybe_emit_alert(
             logger.warning("No email provider configured; skipping email send")
             email_configuration_valid = False
             email_result = {"delivered": False, "status": "not_configured", "reason": "provider_missing"}
-        with ALERT_COOLDOWN_LOCK:
+        with _alert_state_file_lock(state_path):
+            _sync_from_disk_unlocked(state_path, now=now)
             EMAIL_IN_FLIGHT.discard(incident_key)
+            if incident_key in INCIDENT_STATE:
+                INCIDENT_STATE[incident_key]["in_flight_until"] = 0.0
+                INCIDENT_STATE[incident_key]["updated_at"] = now
             if email_result.get("delivered"):
-                ALERT_LAST_SENT[incident_key] = now
+                dict.__setitem__(ALERT_LAST_SENT, incident_key, now)
                 if incident_key in INCIDENT_STATE:
                     INCIDENT_STATE[incident_key]["notified"] = True
                 logger.info("EMAIL_DELIVERED incident=%s", incident_key)
+            _write_state_file_unlocked(state_path, INCIDENT_STATE, ALERT_LAST_SENT)
     logger.info(
         "EMAIL_ENABLED=%s EMAIL_CONFIGURATION_VALID=%s EMAIL_COOLDOWN_ALLOWED=%s "
         "EMAIL_ATTEMPTED=%s BREVO_RESPONSE_STATUS=%s EMAIL_DELIVERED/ACCEPTED=%s",
